@@ -1,0 +1,20 @@
+{
+  "name": "vozia-motor-de-voz",
+  "version": "1.0.0",
+  "description": "Motor de voz do VozIA: Twilio Conversation Relay + Claude + Supabase",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.106.0",
+    "@supabase/supabase-js": "2.108.2",
+    "express": "5.2.1",
+    "twilio": "6.0.2",
+    "ws": "8.21.0"
+  }
+}
