@@ -320,7 +320,22 @@ app.use((err, req, res, next) => {
 
 // ----------------------- WebSocket (a conversa em si) -----------------------
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws" });
+// Dois túneis WebSocket no mesmo servidor:
+//   /ws          → motor ATUAL (Conversation Relay) — não mexer
+//   /ws-streams  → motor NOVO (Media Streams, em construção)
+const wss = new WebSocketServer({ noServer: true });
+const wssStreams = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+  const rota = (req.url || "").split("?")[0];
+  if (rota === "/ws") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else if (rota === "/ws-streams") {
+    wssStreams.handleUpgrade(req, socket, head, (ws) => wssStreams.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
+});
 
 const sessions = new Map();
 
@@ -527,7 +542,114 @@ async function finalizarLigacao(session) {
     console.error("[finalizar] erro ao salvar:", e?.message);
   }
 }
+// ============================================================================
+// ============  FASE 2 — MOTOR NOVO (Twilio Media Streams)  =================
+// ============================================================================
+// Pista paralela: nada aqui mexe no motor atual (Conversation Relay).
+// Teste manual: GET /streams/teste?senha=SEGREDO&para=5518999999999
 
+const ELEVENLABS_VOICE_ID_CLONE = process.env.ELEVENLABS_VOICE_ID_CLONE || "";
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+
+// --- Rota de teste: dispara uma ligação usando o motor novo ---
+app.get("/streams/teste", async (req, res) => {
+  const senha = req.query.senha || "";
+  if (!VOICE_BACKEND_SECRET || senha !== VOICE_BACKEND_SECRET) {
+    return res.status(401).json({ error: "não autorizado" });
+  }
+  if (!twilioClient) return res.status(500).json({ error: "Twilio não configurado" });
+
+  const digitos = String(req.query.para || "").replace(/\D/g, "");
+  if (digitos.length < 12) {
+    return res
+      .status(400)
+      .json({ error: "use ?para=5518999999999 (país + DDD + número, só dígitos)" });
+  }
+  const para = "+" + digitos;
+  const host = PUBLIC_HOST || req.headers.host;
+
+  try {
+    const call = await twilioClient.calls.create({
+      to: para,
+      from: TWILIO_FROM,
+      url: `https://${host}/twiml-streams`,
+    });
+    console.log("[streams/teste] ligando para", para, "callSid:", call.sid);
+    res.json({ ok: true, ligando_para: para, callSid: call.sid });
+  } catch (e) {
+    console.error("[streams/teste] erro:", e?.message);
+    res.status(500).json({ error: e?.message || "erro ao ligar" });
+  }
+});
+
+// --- TwiML do motor novo: frase de teste + abre o túnel de áudio ---
+app.all("/twiml-streams", (req, res) => {
+  const host = PUBLIC_HOST || req.headers.host;
+  const wsUrl = `wss://${host}/ws-streams`;
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice" language="pt-BR">Túnel novo conectado. Fase dois funcionando. Fale alguma coisa e você vai ouvir a sua própria voz de volta, como um eco. Pode falar!</Say>
+  <Connect>
+    <Stream url="${escapeXml(wsUrl)}" />
+  </Connect>
+</Response>`;
+  res.type("text/xml").send(twiml);
+});
+
+// --- O túnel em si: recebe o áudio da ligação e devolve como ECO ---
+wssStreams.on("connection", (ws) => {
+  const st = { streamSid: null, callSid: null, pacotes: 0 };
+  console.log("[streams] túnel aberto, aguardando áudio…");
+
+  ws.on("message", (data) => {
+    let msg;
+    try {
+      msg = JSON.parse(data.toString());
+    } catch {
+      return;
+    }
+
+    if (msg.event === "start") {
+      st.streamSid = msg.start?.streamSid || null;
+      st.callSid = msg.start?.callSid || null;
+      console.log(
+        "[streams] início — callSid:",
+        st.callSid,
+        "| formato:",
+        JSON.stringify(msg.start?.mediaFormat)
+      );
+      return;
+    }
+
+    if (msg.event === "media") {
+      st.pacotes++;
+      if (st.pacotes % 100 === 0)
+        console.log(`[streams] recebendo áudio… ${st.pacotes} pacotes`);
+      // ECO: devolve o áudio recebido (prova o túnel nos DOIS sentidos)
+      if (st.streamSid) {
+        try {
+          ws.send(
+            JSON.stringify({
+              event: "media",
+              streamSid: st.streamSid,
+              media: { payload: msg.media.payload },
+            })
+          );
+        } catch {}
+      }
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log(`[streams] fim do túnel — total de pacotes: ${st.pacotes}`);
+      return;
+    }
+  });
+
+  ws.on("close", () => console.log("[streams] túnel fechado. pacotes:", st.pacotes));
+  ws.on("error", (e) => console.error("[streams] erro no túnel:", e?.message));
+});
 server.listen(PORT, () => {
   console.log(`[VozIA] motor de voz ouvindo na porta ${PORT}`);
   avisarFaltando();
