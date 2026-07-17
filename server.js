@@ -320,6 +320,7 @@ app.use((err, req, res, next) => {
 
 // ----------------------- WebSocket (a conversa em si) -----------------------
 const server = http.createServer(app);
+
 // Dois túneis WebSocket no mesmo servidor:
 //   /ws          → motor ATUAL (Conversation Relay) — não mexer
 //   /ws-streams  → motor NOVO (Media Streams, em construção)
@@ -542,8 +543,9 @@ async function finalizarLigacao(session) {
     console.error("[finalizar] erro ao salvar:", e?.message);
   }
 }
+
 // ============================================================================
-// ============  FASE 2 — MOTOR NOVO (Twilio Media Streams)  =================
+// ============  MOTOR NOVO (Twilio Media Streams) — FASES 2 e 3  =============
 // ============================================================================
 // Pista paralela: nada aqui mexe no motor atual (Conversation Relay).
 // Teste manual: GET /streams/teste?senha=SEGREDO&para=5518999999999
@@ -589,7 +591,7 @@ app.all("/twiml-streams", (req, res) => {
   const wsUrl = `wss://${host}/ws-streams`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="pt-BR">Túnel novo conectado. Fase dois funcionando. Fale alguma coisa e você vai ouvir a sua própria voz de volta, como um eco. Pode falar!</Say>
+  <Say voice="alice" language="pt-BR">Fase três. O ouvido está ligado. Fale algumas frases em português, com pausas entre elas, e depois desligue. Desta vez você não vai ouvir eco. Suas palavras vão aparecer nos registros do sistema. Pode falar!</Say>
   <Connect>
     <Stream url="${escapeXml(wsUrl)}" />
   </Connect>
@@ -597,46 +599,74 @@ app.all("/twiml-streams", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- O túnel em si: recebe o áudio da ligação e devolve como ECO ---
+// --- O túnel em si: agora com OUVIDO (Deepgram transcreve em tempo real) ---
 wssStreams.on("connection", (ws) => {
-  const st = { streamSid: null, callSid: null, pacotes: 0 };
+  const st = { streamSid: null, callSid: null, pacotes: 0, dg: null, dgPronto: false, fila: [] };
   console.log("[streams] túnel aberto, aguardando áudio…");
+
+  // Abre a conexão com o Deepgram (o "ouvido")
+  function abrirOuvido() {
+    if (!DEEPGRAM_API_KEY) {
+      console.error("[deepgram] DEEPGRAM_API_KEY não configurada!");
+      return;
+    }
+    const url =
+      "wss://api.deepgram.com/v1/listen" +
+      "?encoding=mulaw&sample_rate=8000&channels=1" +
+      "&language=pt-BR&model=nova-2" +
+      "&punctuate=true&smart_format=true" +
+      "&interim_results=true&endpointing=300";
+    const dg = new WebSocket(url, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
+    st.dg = dg;
+
+    dg.on("open", () => {
+      st.dgPronto = true;
+      console.log("[deepgram] ouvido conectado ✅");
+      for (const b of st.fila) { try { dg.send(b); } catch {} }
+      st.fila = [];
+    });
+
+    dg.on("message", (raw) => {
+      let ev;
+      try { ev = JSON.parse(raw.toString()); } catch { return; }
+      if (ev.type !== "Results") return;
+      const texto = ev.channel?.alternatives?.[0]?.transcript || "";
+      if (!texto.trim()) return;
+      if (ev.is_final) {
+        console.log(`[ouvido] FINAL: "${texto}"${ev.speech_final ? "  <-- terminou de falar" : ""}`);
+      } else {
+        console.log(`[ouvido] ouvindo… "${texto}"`);
+      }
+    });
+
+    dg.on("error", (e) => console.error("[deepgram] erro:", e?.message));
+    dg.on("close", (code) => {
+      st.dgPronto = false;
+      console.log("[deepgram] ouvido desconectado (código", code + ")");
+    });
+  }
 
   ws.on("message", (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(data.toString()); } catch { return; }
 
     if (msg.event === "start") {
       st.streamSid = msg.start?.streamSid || null;
       st.callSid = msg.start?.callSid || null;
-      console.log(
-        "[streams] início — callSid:",
-        st.callSid,
-        "| formato:",
-        JSON.stringify(msg.start?.mediaFormat)
-      );
+      console.log("[streams] início — callSid:", st.callSid);
+      abrirOuvido();
       return;
     }
 
     if (msg.event === "media") {
       st.pacotes++;
-      if (st.pacotes % 100 === 0)
-        console.log(`[streams] recebendo áudio… ${st.pacotes} pacotes`);
-      // ECO: devolve o áudio recebido (prova o túnel nos DOIS sentidos)
-      if (st.streamSid) {
-        try {
-          ws.send(
-            JSON.stringify({
-              event: "media",
-              streamSid: st.streamSid,
-              media: { payload: msg.media.payload },
-            })
-          );
-        } catch {}
+      if (st.pacotes % 200 === 0) console.log(`[streams] áudio fluindo… ${st.pacotes} pacotes`);
+      const audio = Buffer.from(msg.media.payload, "base64");
+      if (st.dgPronto) {
+        try { st.dg.send(audio); } catch {}
+      } else {
+        st.fila.push(audio);
+        if (st.fila.length > 500) st.fila.shift();
       }
       return;
     }
@@ -647,9 +677,13 @@ wssStreams.on("connection", (ws) => {
     }
   });
 
-  ws.on("close", () => console.log("[streams] túnel fechado. pacotes:", st.pacotes));
+  ws.on("close", () => {
+    console.log("[streams] túnel fechado. pacotes:", st.pacotes);
+    if (st.dg) { try { st.dg.close(); } catch {} }
+  });
   ws.on("error", (e) => console.error("[streams] erro no túnel:", e?.message));
 });
+
 server.listen(PORT, () => {
   console.log(`[VozIA] motor de voz ouvindo na porta ${PORT}`);
   avisarFaltando();
