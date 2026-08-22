@@ -1,15 +1,7 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * Servidor Node.js que conecta a Twilio Conversation Relay ao Claude (Anthropic),
- * lê campanhas/contatos/agentes do Supabase (Lovable Cloud) e grava as ligações.
- *
- * Como o Lovable Cloud não entrega a "service role key", este motor faz LOGIN
- * como o usuário do painel (com e-mail e senha) e, com isso, ganha acesso aos
- * dados respeitando as mesmas regras (RLS) que o painel já usa.
- *
- * IMPORTANTE: NÃO coloque chaves nem senhas neste arquivo. Tudo vem de
- * variáveis de ambiente, configuradas na Railway (veja .env.example).
+ * FASE 4: o motor novo (Media Streams) agora FALA com a voz clonada do Frank.
  * ---------------------------------------------------------------------------
  */
 
@@ -30,11 +22,8 @@ const CLAUDE_MODEL = process.env.CLAUDE_MODEL || "claude-haiku-4-5-20251001";
 const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS || "3", 10);
-// Provedor de reconhecimento de fala (os "ouvidos"). Google é o recomendado pra pt-BR.
 const TRANSCRIPTION_PROVIDER = process.env.TRANSCRIPTION_PROVIDER || "Google";
 
-// Supabase (Lovable Cloud): usamos a URL + a chave pública (anon/publishable)
-// e fazemos login como o usuário do painel.
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
 const SUPABASE_USER_EMAIL = process.env.SUPABASE_USER_EMAIL || "";
@@ -48,8 +37,6 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
-// Cria um cliente Supabase JÁ LOGADO como o usuário do painel.
-// Retorna { client, userId } ou null se algo faltar/falhar.
 async function getSupabaseLogado() {
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !SUPABASE_USER_EMAIL || !SUPABASE_USER_PASSWORD) {
     return null;
@@ -57,7 +44,6 @@ async function getSupabaseLogado() {
   try {
     const client = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
       auth: { persistSession: false, autoRefreshToken: false },
-      // Node < 22 não tem WebSocket nativo; entregamos o pacote "ws" ao Supabase.
       realtime: { transport: WebSocket },
     });
     const { data, error } = await client.auth.signInWithPassword({
@@ -85,6 +71,9 @@ function avisarFaltando() {
   if (!PUBLIC_HOST) faltando.push("PUBLIC_HOST (ou RAILWAY_PUBLIC_DOMAIN)");
   if (!ELEVENLABS_VOICE_ID) faltando.push("ELEVENLABS_VOICE_ID");
   if (!TWILIO_FROM) faltando.push("TWILIO_FROM");
+  if (!DEEPGRAM_API_KEY) faltando.push("DEEPGRAM_API_KEY (motor novo)");
+  if (!ELEVENLABS_API_KEY) faltando.push("ELEVENLABS_API_KEY (motor novo)");
+  if (!ELEVENLABS_VOICE_ID_CLONE) faltando.push("ELEVENLABS_VOICE_ID_CLONE (motor novo)");
   if (faltando.length)
     console.warn("[VozIA] Variáveis ainda não configuradas:", faltando.join(", "));
 }
@@ -106,7 +95,7 @@ function preencherNome(texto = "", nome = "") {
 
 function resolverVoz(agente) {
   const v = agente && agente.voz_id ? String(agente.voz_id).trim() : "";
-  if (/^[A-Za-z0-9]{18,}$/.test(v)) return v; // parece um Voice ID do ElevenLabs
+  if (/^[A-Za-z0-9]{18,}$/.test(v)) return v;
   return ELEVENLABS_VOICE_ID;
 }
 
@@ -124,7 +113,6 @@ function sanitizar(mensagens) {
   return out;
 }
 
-// Carrega campanha + agente + contato usando um cliente já logado
 async function carregarContexto(client, campanhaId, contatoId) {
   const { data: campanha } = await client
     .from("campanhas")
@@ -175,8 +163,6 @@ app.use(express.json());
 
 app.get("/", (req, res) => res.send("VozIA — motor de voz online ✅"));
 
-// TwiML: a Twilio busca isto quando a ligação conecta.
-// Não acessa o banco: recebe a saudação/voz/idioma já prontos na URL (vindos do discador).
 app.all("/twiml", (req, res) => {
   const campanhaId = req.query.campanha_id || "";
   const contatoId = req.query.contato_id || "";
@@ -203,7 +189,6 @@ app.all("/twiml", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Discador: o painel (via Edge Function) chama isto para iniciar a campanha
 app.post("/campanhas/iniciar", async (req, res) => {
   const auth = req.headers.authorization || "";
   if (!VOICE_BACKEND_SECRET || auth !== `Bearer ${VOICE_BACKEND_SECRET}`) {
@@ -310,20 +295,15 @@ app.post("/campanhas/iniciar", async (req, res) => {
   }
 });
 
-// Tratador de erros global: garante que qualquer erro inesperado vira uma
-// mensagem JSON legível (e não a página genérica "Internal Server Error").
 app.use((err, req, res, next) => {
   console.error("[erro nao tratado]", err);
   if (res.headersSent) return next(err);
   res.status(500).json({ error: "erro interno: " + (err?.message || "desconhecido") });
 });
 
-// ----------------------- WebSocket (a conversa em si) -----------------------
+// ----------------------- WebSocket -----------------------
 const server = http.createServer(app);
 
-// Dois túneis WebSocket no mesmo servidor:
-//   /ws          → motor ATUAL (Conversation Relay) — não mexer
-//   /ws-streams  → motor NOVO (Media Streams, em construção)
 const wss = new WebSocketServer({ noServer: true });
 const wssStreams = new WebSocketServer({ noServer: true });
 
@@ -372,7 +352,6 @@ wss.on("connection", (ws) => {
       session.campanhaId = p.campanha_id || "";
       session.contatoId = p.contato_id || "";
 
-      // loga no banco e carrega o contexto (persona do agente + nome do contato)
       let saudacao = "Olá!";
       const sb = await getSupabaseLogado();
       if (sb && session.campanhaId) {
@@ -545,16 +524,21 @@ async function finalizarLigacao(session) {
 }
 
 // ============================================================================
-// ============  MOTOR NOVO (Twilio Media Streams) — FASES 2 e 3  =============
+// =========  MOTOR NOVO (Twilio Media Streams) — FASES 2, 3 e 4  =============
 // ============================================================================
-// Pista paralela: nada aqui mexe no motor atual (Conversation Relay).
-// Teste manual: GET /streams/teste?senha=SEGREDO&para=5518999999999
 
 const ELEVENLABS_VOICE_ID_CLONE = process.env.ELEVENLABS_VOICE_ID_CLONE || "";
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
+const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "eleven_flash_v2_5";
 
-// --- Rota de teste: dispara uma ligação usando o motor novo ---
+// Frase de teste da Fase 4 — falada com a SUA voz clonada
+const FRASE_TESTE_FASE4 =
+  "Oi Frank! Se você está me ouvindo agora, essa é a sua própria voz clonada, " +
+  "saindo direto do motor da VozIA. A fase quatro está funcionando. " +
+  "Agora falta só ligar o cérebro, e a gente vai conversar de verdade. " +
+  "Pode falar alguma coisa, que eu continuo escutando, e depois pode desligar!";
+
 app.get("/streams/teste", async (req, res) => {
   const senha = req.query.senha || "";
   if (!VOICE_BACKEND_SECRET || senha !== VOICE_BACKEND_SECRET) {
@@ -585,13 +569,12 @@ app.get("/streams/teste", async (req, res) => {
   }
 });
 
-// --- TwiML do motor novo: frase de teste + abre o túnel de áudio ---
+// --- TwiML do motor novo: abre o túnel direto, sem voz robótica ---
 app.all("/twiml-streams", (req, res) => {
   const host = PUBLIC_HOST || req.headers.host;
   const wsUrl = `wss://${host}/ws-streams`;
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="pt-BR">Fase três. O ouvido está ligado. Fale algumas frases em português, com pausas entre elas, e depois desligue. Desta vez você não vai ouvir eco. Suas palavras vão aparecer nos registros do sistema. Pode falar!</Say>
   <Connect>
     <Stream url="${escapeXml(wsUrl)}" />
   </Connect>
@@ -599,12 +582,82 @@ app.all("/twiml-streams", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// --- O túnel em si: agora com OUVIDO (Deepgram transcreve em tempo real) ---
+// ----------------------------------------------------------------------------
+// A BOCA: pede o áudio pra ElevenLabs (sua voz clonada, formato de telefone)
+// e devolve pelo túnel pra pessoa ouvir.
+// ----------------------------------------------------------------------------
+async function falarComMinhaVoz(ws, streamSid, texto) {
+  if (!ELEVENLABS_API_KEY) {
+    console.error("[boca] ELEVENLABS_API_KEY não configurada!");
+    return;
+  }
+  if (!ELEVENLABS_VOICE_ID_CLONE) {
+    console.error("[boca] ELEVENLABS_VOICE_ID_CLONE não configurada!");
+    return;
+  }
+  if (!streamSid) {
+    console.error("[boca] sem streamSid — não dá pra enviar áudio");
+    return;
+  }
+
+  const inicio = Date.now();
+  const url =
+    `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID_CLONE}/stream` +
+    `?output_format=ulaw_8000`;
+
+  console.log(`[boca] pedindo áudio pra ElevenLabs (voz ${ELEVENLABS_VOICE_ID_CLONE})…`);
+
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text: texto,
+        model_id: ELEVENLABS_MODEL,
+        language_code: "pt",
+        voice_settings: { stability: 0.5, similarity_boost: 0.8 },
+      }),
+    });
+
+    if (!resp.ok) {
+      const erro = await resp.text();
+      console.error("[boca] ElevenLabs recusou:", resp.status, erro.slice(0, 400));
+      return;
+    }
+
+    const audio = Buffer.from(await resp.arrayBuffer());
+    const demorou = Date.now() - inicio;
+    console.log(`[boca] áudio pronto: ${audio.length} bytes em ${demorou}ms`);
+
+    // Manda em pedacinhos de 80ms (a Twilio guarda e toca na velocidade certa)
+    const PEDACO = 640;
+    let enviados = 0;
+    for (let i = 0; i < audio.length; i += PEDACO) {
+      const parte = audio.subarray(i, i + PEDACO);
+      ws.send(
+        JSON.stringify({
+          event: "media",
+          streamSid,
+          media: { payload: parte.toString("base64") },
+        })
+      );
+      enviados++;
+    }
+    ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "fim-da-fala" } }));
+    console.log(`[boca] ${enviados} pedaços enviados — o telefone está falando ✅`);
+  } catch (e) {
+    console.error("[boca] erro:", e?.message || e);
+  }
+}
+
+// --- O túnel: OUVIDO (Deepgram) + BOCA (ElevenLabs) ---
 wssStreams.on("connection", (ws) => {
   const st = { streamSid: null, callSid: null, pacotes: 0, dg: null, dgPronto: false, fila: [] };
   console.log("[streams] túnel aberto, aguardando áudio…");
 
-  // Abre a conexão com o Deepgram (o "ouvido")
   function abrirOuvido() {
     if (!DEEPGRAM_API_KEY) {
       console.error("[deepgram] DEEPGRAM_API_KEY não configurada!");
@@ -655,6 +708,7 @@ wssStreams.on("connection", (ws) => {
       st.callSid = msg.start?.callSid || null;
       console.log("[streams] início — callSid:", st.callSid);
       abrirOuvido();
+      falarComMinhaVoz(ws, st.streamSid, FRASE_TESTE_FASE4);
       return;
     }
 
@@ -668,6 +722,11 @@ wssStreams.on("connection", (ws) => {
         st.fila.push(audio);
         if (st.fila.length > 500) st.fila.shift();
       }
+      return;
+    }
+
+    if (msg.event === "mark") {
+      console.log("[streams] a fala terminou de tocar:", msg.mark?.name);
       return;
     }
 
