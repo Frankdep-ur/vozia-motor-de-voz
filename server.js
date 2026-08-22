@@ -1,7 +1,8 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 4: o motor novo (Media Streams) agora FALA com a voz clonada do Frank.
+ * FASE 5: o motor novo agora CONVERSA.
+ * Deepgram ouve  ->  Claude pensa  ->  ElevenLabs fala com a voz do Frank.
  * ---------------------------------------------------------------------------
  */
 
@@ -12,7 +13,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import twilio from "twilio";
 import { createClient } from "@supabase/supabase-js";
 
-// ----------------------- Configuração (variáveis de ambiente) -----------------------
+// ----------------------- Configuração -----------------------
 const PORT = process.env.PORT || 8080;
 const PUBLIC_HOST = (process.env.PUBLIC_HOST || process.env.RAILWAY_PUBLIC_DOMAIN || "")
   .replace(/^https?:\/\//, "")
@@ -76,6 +77,15 @@ function avisarFaltando() {
   if (!ELEVENLABS_VOICE_ID_CLONE) faltando.push("ELEVENLABS_VOICE_ID_CLONE (motor novo)");
   if (faltando.length)
     console.warn("[VozIA] Variáveis ainda não configuradas:", faltando.join(", "));
+
+  // Trava de segurança: o motor antigo NÃO aceita voz clonada
+  if (ELEVENLABS_VOICE_ID && ELEVENLABS_VOICE_ID === ELEVENLABS_VOICE_ID_CLONE) {
+    console.warn(
+      "[VozIA] ATENÇÃO: ELEVENLABS_VOICE_ID está igual à voz clonada! " +
+      "O motor antigo (Conversation Relay) vai falhar e cair em voz padrão em inglês. " +
+      "Coloque nela uma voz do catálogo da Twilio."
+    );
+  }
 }
 
 // ----------------------- Utilidades -----------------------
@@ -524,7 +534,7 @@ async function finalizarLigacao(session) {
 }
 
 // ============================================================================
-// =========  MOTOR NOVO (Twilio Media Streams) — FASES 2, 3 e 4  =============
+// ========  MOTOR NOVO (Media Streams) — FASES 2, 3, 4 e 5  ==================
 // ============================================================================
 
 const ELEVENLABS_VOICE_ID_CLONE = process.env.ELEVENLABS_VOICE_ID_CLONE || "";
@@ -532,12 +542,37 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "eleven_flash_v2_5";
 
-// Frase de teste da Fase 4 — falada com a SUA voz clonada
-const FRASE_TESTE_FASE4 =
-  "Oi Frank! Se você está me ouvindo agora, essa é a sua própria voz clonada, " +
-  "saindo direto do motor da VozIA. A fase quatro está funcionando. " +
-  "Agora falta só ligar o cérebro, e a gente vai conversar de verdade. " +
-  "Pode falar alguma coisa, que eu continuo escutando, e depois pode desligar!";
+// Persona de TESTE da Fase 5 (na Fase 7 isso vem do painel/Supabase)
+const PERSONA_TESTE_FASE5 = `Você é o Rafael, consultor da Invite Energy, empresa de energia solar por assinatura.
+
+O QUE VOCÊ OFERECE:
+- Desconto de até trinta por cento na conta de luz.
+- Sem obra, sem instalação de placas, sem investimento nenhum.
+- A pessoa continua com a mesma distribuidora, só passa a receber crédito de energia limpa.
+- É regulamentado pela ANEEL.
+- Só faz sentido para quem tem conta de luz acima de duzentos e cinquenta reais.
+
+SEU OBJETIVO NESTA LIGAÇÃO:
+1. Confirmar se a pessoa é titular da conta de luz.
+2. Descobrir mais ou menos quanto vem a conta por mês.
+3. Se for acima de duzentos e cinquenta reais, oferecer mandar os detalhes pelo WhatsApp.
+4. Você NÃO fecha contrato por telefone. O objetivo é agendar o WhatsApp.
+
+REGRAS ABSOLUTAS:
+- Nunca peça CPF, senha, dados bancários ou número de cartão.
+- Nunca prometa valor exato de economia. Fale sempre em "até trinta por cento".
+- Se a pessoa não tiver interesse, agradeça com simpatia e encerre. Não insista.
+
+COMO FALAR (isto é uma ligação telefônica de verdade):
+- Português do Brasil, informal e caloroso, como gente de verdade fala.
+- Frases CURTAS. Uma ideia por vez. No máximo duas frases por resposta.
+- Números sempre por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
+- Nada de listas, asteriscos, emojis ou formatação. Só o texto que será falado.
+- Se não entender o que a pessoa disse, peça pra repetir de forma simpática.`;
+
+const SAUDACAO_TESTE_FASE5 =
+  "Alô, tudo bem? Aqui é o Rafael, da Invite Energy. " +
+  "Eu ligo rapidinho pra falar de desconto na conta de luz. Você tem um minutinho?";
 
 app.get("/streams/teste", async (req, res) => {
   const senha = req.query.senha || "";
@@ -569,7 +604,6 @@ app.get("/streams/teste", async (req, res) => {
   }
 });
 
-// --- TwiML do motor novo: abre o túnel direto, sem voz robótica ---
 app.all("/twiml-streams", (req, res) => {
   const host = PUBLIC_HOST || req.headers.host;
   const wsUrl = `wss://${host}/ws-streams`;
@@ -582,30 +616,25 @@ app.all("/twiml-streams", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// ----------------------------------------------------------------------------
-// A BOCA: pede o áudio pra ElevenLabs (sua voz clonada, formato de telefone)
-// e devolve pelo túnel pra pessoa ouvir.
-// ----------------------------------------------------------------------------
+// ---------------- A BOCA: ElevenLabs -> telefone ----------------
 async function falarComMinhaVoz(ws, streamSid, texto) {
   if (!ELEVENLABS_API_KEY) {
     console.error("[boca] ELEVENLABS_API_KEY não configurada!");
-    return;
+    return false;
   }
   if (!ELEVENLABS_VOICE_ID_CLONE) {
     console.error("[boca] ELEVENLABS_VOICE_ID_CLONE não configurada!");
-    return;
+    return false;
   }
   if (!streamSid) {
     console.error("[boca] sem streamSid — não dá pra enviar áudio");
-    return;
+    return false;
   }
 
   const inicio = Date.now();
   const url =
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID_CLONE}/stream` +
     `?output_format=ulaw_8000`;
-
-  console.log(`[boca] pedindo áudio pra ElevenLabs (voz ${ELEVENLABS_VOICE_ID_CLONE})…`);
 
   try {
     const resp = await fetch(url, {
@@ -625,16 +654,13 @@ async function falarComMinhaVoz(ws, streamSid, texto) {
     if (!resp.ok) {
       const erro = await resp.text();
       console.error("[boca] ElevenLabs recusou:", resp.status, erro.slice(0, 400));
-      return;
+      return false;
     }
 
     const audio = Buffer.from(await resp.arrayBuffer());
-    const demorou = Date.now() - inicio;
-    console.log(`[boca] áudio pronto: ${audio.length} bytes em ${demorou}ms`);
+    console.log(`[boca] áudio pronto: ${audio.length} bytes em ${Date.now() - inicio}ms`);
 
-    // Manda em pedacinhos de 80ms (a Twilio guarda e toca na velocidade certa)
     const PEDACO = 640;
-    let enviados = 0;
     for (let i = 0; i < audio.length; i += PEDACO) {
       const parte = audio.subarray(i, i + PEDACO);
       ws.send(
@@ -644,18 +670,78 @@ async function falarComMinhaVoz(ws, streamSid, texto) {
           media: { payload: parte.toString("base64") },
         })
       );
-      enviados++;
     }
     ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "fim-da-fala" } }));
-    console.log(`[boca] ${enviados} pedaços enviados — o telefone está falando ✅`);
+    return true;
   } catch (e) {
     console.error("[boca] erro:", e?.message || e);
+    return false;
   }
 }
 
-// --- O túnel: OUVIDO (Deepgram) + BOCA (ElevenLabs) ---
+// ---------------- O CÉREBRO: Claude pensa e responde ----------------
+async function pensarEResponder(ws, st, falaDoCliente) {
+  if (!falaDoCliente) return;
+  if (!anthropic) {
+    console.error("[cerebro] ANTHROPIC_API_KEY não configurada!");
+    return;
+  }
+  if (st.ocupado) {
+    console.log("[cerebro] ainda ocupado — ignorando esta fala");
+    return;
+  }
+
+  st.ocupado = true;
+  const inicio = Date.now();
+
+  // Solta a trava sozinha se algo travar (segurança)
+  if (st.destravar) clearTimeout(st.destravar);
+  st.destravar = setTimeout(() => {
+    console.log("[cerebro] destravando por segurança");
+    st.ocupado = false;
+  }, 30000);
+
+  try {
+    st.historico.push({ role: "user", content: falaDoCliente });
+
+    const r = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 200,
+      system: PERSONA_TESTE_FASE5,
+      messages: sanitizar(st.historico),
+    });
+
+    const resposta = (r.content?.[0]?.text || "").trim();
+    console.log(`[cerebro] pensou em ${Date.now() - inicio}ms: "${resposta}"`);
+
+    if (!resposta) {
+      st.ocupado = false;
+      return;
+    }
+
+    st.historico.push({ role: "assistant", content: resposta });
+    const ok = await falarComMinhaVoz(ws, st.streamSid, resposta);
+    if (!ok) st.ocupado = false;
+  } catch (e) {
+    console.error("[cerebro] erro:", e?.message || e);
+    st.ocupado = false;
+  }
+}
+
+// ---------------- O TÚNEL: ouvido + cérebro + boca ----------------
 wssStreams.on("connection", (ws) => {
-  const st = { streamSid: null, callSid: null, pacotes: 0, dg: null, dgPronto: false, fila: [] };
+  const st = {
+    streamSid: null,
+    callSid: null,
+    pacotes: 0,
+    dg: null,
+    dgPronto: false,
+    fila: [],
+    balde: "",
+    historico: [],
+    ocupado: false,
+    destravar: null,
+  };
   console.log("[streams] túnel aberto, aguardando áudio…");
 
   function abrirOuvido() {
@@ -678,72 +764,3 @@ wssStreams.on("connection", (ws) => {
       for (const b of st.fila) { try { dg.send(b); } catch {} }
       st.fila = [];
     });
-
-    dg.on("message", (raw) => {
-      let ev;
-      try { ev = JSON.parse(raw.toString()); } catch { return; }
-      if (ev.type !== "Results") return;
-      const texto = ev.channel?.alternatives?.[0]?.transcript || "";
-      if (!texto.trim()) return;
-      if (ev.is_final) {
-        console.log(`[ouvido] FINAL: "${texto}"${ev.speech_final ? "  <-- terminou de falar" : ""}`);
-      } else {
-        console.log(`[ouvido] ouvindo… "${texto}"`);
-      }
-    });
-
-    dg.on("error", (e) => console.error("[deepgram] erro:", e?.message));
-    dg.on("close", (code) => {
-      st.dgPronto = false;
-      console.log("[deepgram] ouvido desconectado (código", code + ")");
-    });
-  }
-
-  ws.on("message", (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
-
-    if (msg.event === "start") {
-      st.streamSid = msg.start?.streamSid || null;
-      st.callSid = msg.start?.callSid || null;
-      console.log("[streams] início — callSid:", st.callSid);
-      abrirOuvido();
-      falarComMinhaVoz(ws, st.streamSid, FRASE_TESTE_FASE4);
-      return;
-    }
-
-    if (msg.event === "media") {
-      st.pacotes++;
-      if (st.pacotes % 200 === 0) console.log(`[streams] áudio fluindo… ${st.pacotes} pacotes`);
-      const audio = Buffer.from(msg.media.payload, "base64");
-      if (st.dgPronto) {
-        try { st.dg.send(audio); } catch {}
-      } else {
-        st.fila.push(audio);
-        if (st.fila.length > 500) st.fila.shift();
-      }
-      return;
-    }
-
-    if (msg.event === "mark") {
-      console.log("[streams] a fala terminou de tocar:", msg.mark?.name);
-      return;
-    }
-
-    if (msg.event === "stop") {
-      console.log(`[streams] fim do túnel — total de pacotes: ${st.pacotes}`);
-      return;
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("[streams] túnel fechado. pacotes:", st.pacotes);
-    if (st.dg) { try { st.dg.close(); } catch {} }
-  });
-  ws.on("error", (e) => console.error("[streams] erro no túnel:", e?.message));
-});
-
-server.listen(PORT, () => {
-  console.log(`[VozIA] motor de voz ouvindo na porta ${PORT}`);
-  avisarFaltando();
-});
