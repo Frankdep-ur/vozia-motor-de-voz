@@ -1,8 +1,7 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 5: o motor novo agora CONVERSA.
- * Deepgram ouve  ->  Claude pensa  ->  ElevenLabs fala com a voz do Frank.
+ * FASE 6: interrupção (barge-in) + resposta falada frase a frase.
  * ---------------------------------------------------------------------------
  */
 
@@ -78,12 +77,10 @@ function avisarFaltando() {
   if (faltando.length)
     console.warn("[VozIA] Variáveis ainda não configuradas:", faltando.join(", "));
 
-  // Trava de segurança: o motor antigo NÃO aceita voz clonada
   if (ELEVENLABS_VOICE_ID && ELEVENLABS_VOICE_ID === ELEVENLABS_VOICE_ID_CLONE) {
     console.warn(
       "[VozIA] ATENÇÃO: ELEVENLABS_VOICE_ID está igual à voz clonada! " +
-      "O motor antigo (Conversation Relay) vai falhar e cair em voz padrão em inglês. " +
-      "Coloque nela uma voz do catálogo da Twilio."
+      "O motor antigo (Conversation Relay) vai cair em voz padrão em inglês."
     );
   }
 }
@@ -534,7 +531,7 @@ async function finalizarLigacao(session) {
 }
 
 // ============================================================================
-// ========  MOTOR NOVO (Media Streams) — FASES 2, 3, 4 e 5  ==================
+// ======  MOTOR NOVO (Media Streams) — FASES 2, 3, 4, 5 e 6  =================
 // ============================================================================
 
 const ELEVENLABS_VOICE_ID_CLONE = process.env.ELEVENLABS_VOICE_ID_CLONE || "";
@@ -542,7 +539,6 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
 const ELEVENLABS_MODEL = process.env.ELEVENLABS_MODEL || "eleven_flash_v2_5";
 
-// Persona de TESTE da Fase 5 (na Fase 7 isso vem do painel/Supabase)
 const PERSONA_TESTE_FASE5 = `Você é o Rafael, consultor da Invite Energy, empresa de energia solar por assinatura.
 
 O QUE VOCÊ OFERECE:
@@ -558,21 +554,33 @@ SEU OBJETIVO NESTA LIGAÇÃO:
 3. Se for acima de duzentos e cinquenta reais, oferecer mandar os detalhes pelo WhatsApp.
 4. Você NÃO fecha contrato por telefone. O objetivo é agendar o WhatsApp.
 
+REGRA DE TAMANHO (A MAIS IMPORTANTE DE TODAS):
+- No MÁXIMO duas frases curtas por resposta. Sem exceção.
+- Você tem no máximo oito segundos de fala por vez. Se não couber, corte.
+- Prefira responder e devolver a bola com uma pergunta curta.
+- NUNCA emende três assuntos. Uma ideia por vez, e espere a pessoa responder.
+
+REGRA SOBRE NOMES (CRÍTICA):
+- Você está numa ligação telefônica e a transcrição erra nomes com frequência.
+- NUNCA chame a pessoa por um nome que você "ouviu" na conversa. A escuta falha.
+- Se não tiver certeza absoluta do nome, simplesmente não use nome nenhum.
+- É muito melhor não usar nome do que usar o nome errado.
+
 REGRAS ABSOLUTAS:
 - Nunca peça CPF, senha, dados bancários ou número de cartão.
 - Nunca prometa valor exato de economia. Fale sempre em "até trinta por cento".
 - Se a pessoa não tiver interesse, agradeça com simpatia e encerre. Não insista.
+- Se a pessoa te interromper, pare o assunto anterior e responda o que ela perguntou.
 
-COMO FALAR (isto é uma ligação telefônica de verdade):
+COMO FALAR:
 - Português do Brasil, informal e caloroso, como gente de verdade fala.
-- Frases CURTAS. Uma ideia por vez. No máximo duas frases por resposta.
 - Números sempre por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
 - Nada de listas, asteriscos, emojis ou formatação. Só o texto que será falado.
 - Se não entender o que a pessoa disse, peça pra repetir de forma simpática.`;
 
 const SAUDACAO_TESTE_FASE5 =
   "Alô, tudo bem? Aqui é o Rafael, da Invite Energy. " +
-  "Eu ligo rapidinho pra falar de desconto na conta de luz. Você tem um minutinho?";
+  "Ligo rapidinho pra falar de desconto na conta de luz. Você tem um minutinho?";
 
 app.get("/streams/teste", async (req, res) => {
   const senha = req.query.senha || "";
@@ -616,21 +624,18 @@ app.all("/twiml-streams", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// ---------------- A BOCA: ElevenLabs -> telefone ----------------
-async function falarComMinhaVoz(ws, streamSid, texto) {
-  if (!ELEVENLABS_API_KEY) {
-    console.error("[boca] ELEVENLABS_API_KEY não configurada!");
-    return false;
-  }
-  if (!ELEVENLABS_VOICE_ID_CLONE) {
-    console.error("[boca] ELEVENLABS_VOICE_ID_CLONE não configurada!");
-    return false;
-  }
-  if (!streamSid) {
-    console.error("[boca] sem streamSid — não dá pra enviar áudio");
+const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// ------------------------------------------------------------------
+// A BOCA (Fase 6): manda o áudio em levas, podendo ser INTERROMPIDA
+// ------------------------------------------------------------------
+async function falarComMinhaVoz(ws, st, texto) {
+  if (!ELEVENLABS_API_KEY || !ELEVENLABS_VOICE_ID_CLONE || !st.streamSid) {
+    console.error("[boca] faltando chave, voz ou streamSid");
     return false;
   }
 
+  const meuTurno = st.turno; // se mudar, fui interrompido
   const inicio = Date.now();
   const url =
     `https://api.elevenlabs.io/v1/text-to-speech/${ELEVENLABS_VOICE_ID_CLONE}/stream` +
@@ -639,10 +644,7 @@ async function falarComMinhaVoz(ws, streamSid, texto) {
   try {
     const resp = await fetch(url, {
       method: "POST",
-      headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json",
-      },
+      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({
         text: texto,
         model_id: ELEVENLABS_MODEL,
@@ -653,25 +655,44 @@ async function falarComMinhaVoz(ws, streamSid, texto) {
 
     if (!resp.ok) {
       const erro = await resp.text();
-      console.error("[boca] ElevenLabs recusou:", resp.status, erro.slice(0, 400));
+      console.error("[boca] ElevenLabs recusou:", resp.status, erro.slice(0, 300));
       return false;
     }
 
     const audio = Buffer.from(await resp.arrayBuffer());
     console.log(`[boca] áudio pronto: ${audio.length} bytes em ${Date.now() - inicio}ms`);
 
+    if (st.turno !== meuTurno) {
+      console.log("[boca] interrompido antes de começar — descartando");
+      return false;
+    }
+
+    // Envia em levas de 1 segundo, checando interrupção entre elas.
+    // (mulaw 8000 = 8000 bytes por segundo de áudio)
     const PEDACO = 640;
+    const POR_LEVA = 12; // ~0,77s de áudio por leva
+    let desde = 0;
+
     for (let i = 0; i < audio.length; i += PEDACO) {
-      const parte = audio.subarray(i, i + PEDACO);
+      if (st.turno !== meuTurno) {
+        console.log("[boca] 🛑 interrompido no meio da fala");
+        return false;
+      }
       ws.send(
         JSON.stringify({
           event: "media",
-          streamSid,
-          media: { payload: parte.toString("base64") },
+          streamSid: st.streamSid,
+          media: { payload: audio.subarray(i, i + PEDACO).toString("base64") },
         })
       );
+      if (++desde >= POR_LEVA) {
+        desde = 0;
+        await pausa(600); // deixa a Twilio tocar e nos dá janela pra interromper
+      }
     }
-    ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "fim-da-fala" } }));
+
+    if (st.turno !== meuTurno) return false;
+    ws.send(JSON.stringify({ event: "mark", streamSid: st.streamSid, mark: { name: "fim-da-fala" } }));
     return true;
   } catch (e) {
     console.error("[boca] erro:", e?.message || e);
@@ -679,56 +700,102 @@ async function falarComMinhaVoz(ws, streamSid, texto) {
   }
 }
 
-// ---------------- O CÉREBRO: Claude pensa e responde ----------------
+// Corta a fala na hora: esvazia o que a Twilio tem na fila
+function calarABoca(ws, st, motivo) {
+  st.turno++; // invalida qualquer fala em andamento
+  if (st.streamSid) {
+    try {
+      ws.send(JSON.stringify({ event: "clear", streamSid: st.streamSid }));
+    } catch {}
+  }
+  st.falando = false;
+  console.log(`[barge-in] ✋ calei a boca (${motivo})`);
+}
+
+// ------------------------------------------------------------------
+// O CÉREBRO (Fase 6): fala frase a frase, sem esperar o texto todo
+// ------------------------------------------------------------------
 async function pensarEResponder(ws, st, falaDoCliente) {
-  if (!falaDoCliente) return;
-  if (!anthropic) {
-    console.error("[cerebro] ANTHROPIC_API_KEY não configurada!");
-    return;
-  }
-  if (st.ocupado) {
-    console.log("[cerebro] ainda ocupado — ignorando esta fala");
-    return;
-  }
+  if (!falaDoCliente || !anthropic) return;
 
-  st.ocupado = true;
+  st.turno++;
+  const meuTurno = st.turno;
+  st.falando = true;
   const inicio = Date.now();
-
-  // Solta a trava sozinha se algo travar (segurança)
-  if (st.destravar) clearTimeout(st.destravar);
-  st.destravar = setTimeout(() => {
-    console.log("[cerebro] destravando por segurança");
-    st.ocupado = false;
-  }, 30000);
+  let primeiraFalaEm = 0;
 
   try {
     st.historico.push({ role: "user", content: falaDoCliente });
 
-    const r = await anthropic.messages.create({
+    const stream = anthropic.messages.stream({
       model: CLAUDE_MODEL,
-      max_tokens: 200,
+      max_tokens: 120,
       system: PERSONA_TESTE_FASE5,
       messages: sanitizar(st.historico),
     });
+    st.streamClaude = stream;
 
-    const resposta = (r.content?.[0]?.text || "").trim();
-    console.log(`[cerebro] pensou em ${Date.now() - inicio}ms: "${resposta}"`);
+    let buffer = "";
+    let completo = "";
+    const frases = [];
 
-    if (!resposta) {
-      st.ocupado = false;
-      return;
+    stream.on("text", (delta) => {
+      buffer += delta;
+      completo += delta;
+      // Corta em pontuação forte: já dá pra mandar essa frase pra voz
+      let m;
+      while ((m = buffer.match(/^([\s\S]*?[.!?…]+)(\s|$)/))) {
+        frases.push(m[1].trim());
+        buffer = buffer.slice(m[0].length);
+      }
+    });
+
+    // Vai falando as frases conforme elas ficam prontas
+    const falarFila = (async () => {
+      let jaFalei = 0;
+      while (true) {
+        if (st.turno !== meuTurno) return;
+        if (jaFalei < frases.length) {
+          const frase = frases[jaFalei++];
+          if (!primeiraFalaEm) {
+            primeiraFalaEm = Date.now() - inicio;
+            console.log(`[cerebro] ⚡ primeira frase em ${primeiraFalaEm}ms: "${frase}"`);
+          } else {
+            console.log(`[cerebro] próxima frase: "${frase}"`);
+          }
+          await falarComMinhaVoz(ws, st, frase);
+        } else if (stream.messages !== undefined && st.claudeTerminou) {
+          if (buffer.trim() && st.turno === meuTurno) {
+            await falarComMinhaVoz(ws, st, buffer.trim());
+            buffer = "";
+          }
+          return;
+        } else {
+          await pausa(60);
+        }
+      }
+    })();
+
+    await stream.finalMessage();
+    st.claudeTerminou = true;
+    await falarFila;
+
+    if (st.turno === meuTurno) {
+      if (completo.trim()) st.historico.push({ role: "assistant", content: completo.trim() });
+      console.log(`[cerebro] turno completo em ${Date.now() - inicio}ms`);
+      st.falando = false;
     }
-
-    st.historico.push({ role: "assistant", content: resposta });
-    const ok = await falarComMinhaVoz(ws, st.streamSid, resposta);
-    if (!ok) st.ocupado = false;
   } catch (e) {
-    console.error("[cerebro] erro:", e?.message || e);
-    st.ocupado = false;
+    if (e?.name !== "APIUserAbortError" && e?.name !== "AbortError")
+      console.error("[cerebro] erro:", e?.message || e);
+  } finally {
+    st.claudeTerminou = false;
+    st.streamClaude = null;
+    if (st.turno === meuTurno) st.falando = false;
   }
 }
 
-// ---------------- O TÚNEL: ouvido + cérebro + boca ----------------
+// ---------------- O TÚNEL ----------------
 wssStreams.on("connection", (ws) => {
   const st = {
     streamSid: null,
@@ -739,8 +806,10 @@ wssStreams.on("connection", (ws) => {
     fila: [],
     balde: "",
     historico: [],
-    ocupado: false,
-    destravar: null,
+    turno: 0,
+    falando: false,
+    claudeTerminou: false,
+    streamClaude: null,
   };
   console.log("[streams] túnel aberto, aguardando áudio…");
 
@@ -769,17 +838,19 @@ wssStreams.on("connection", (ws) => {
       let ev;
       try { ev = JSON.parse(raw.toString()); } catch { return; }
       if (ev.type !== "Results") return;
-      const texto = ev.channel?.alternatives?.[0]?.transcript || "";
-      if (!texto.trim()) return;
+      const texto = (ev.channel?.alternatives?.[0]?.transcript || "").trim();
+      if (!texto) return;
 
-      if (!ev.is_final) {
-        console.log(`[ouvido] ouvindo… "${texto}"`);
-        return;
+      // BARGE-IN: se ele está falando e a pessoa começou a falar, cala a boca
+      if (st.falando && texto.length >= 3) {
+        if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
+        calarABoca(ws, st, `pessoa disse: "${texto}"`);
+        st.balde = "";
       }
 
-      // O BALDE: junta os pedaços até a pessoa terminar de falar
-      st.balde = (st.balde ? st.balde + " " : "") + texto.trim();
-      console.log(`[ouvido] FINAL: "${texto}"`);
+      if (!ev.is_final) return;
+
+      st.balde = (st.balde ? st.balde + " " : "") + texto;
 
       if (ev.speech_final) {
         const falaCompleta = st.balde.trim();
@@ -806,18 +877,16 @@ wssStreams.on("connection", (ws) => {
       st.callSid = msg.start?.callSid || null;
       console.log("[streams] início — callSid:", st.callSid);
       abrirOuvido();
-      // Saudação de abertura, com a voz clonada
-      st.ocupado = true;
+      st.turno++;
+      st.falando = true;
       st.historico.push({ role: "assistant", content: SAUDACAO_TESTE_FASE5 });
-      falarComMinhaVoz(ws, st.streamSid, SAUDACAO_TESTE_FASE5).then((ok) => {
-        if (!ok) st.ocupado = false;
-      });
+      falarComMinhaVoz(ws, st, SAUDACAO_TESTE_FASE5).then(() => { st.falando = false; });
       return;
     }
 
     if (msg.event === "media") {
       st.pacotes++;
-      if (st.pacotes % 400 === 0) console.log(`[streams] áudio fluindo… ${st.pacotes} pacotes`);
+      if (st.pacotes % 800 === 0) console.log(`[streams] áudio fluindo… ${st.pacotes} pacotes`);
       const audio = Buffer.from(msg.media.payload, "base64");
       if (st.dgPronto) {
         try { st.dg.send(audio); } catch {}
@@ -829,9 +898,8 @@ wssStreams.on("connection", (ws) => {
     }
 
     if (msg.event === "mark") {
-      console.log("[streams] terminou de falar — pronto pra ouvir 👂");
-      if (st.destravar) clearTimeout(st.destravar);
-      st.ocupado = false;
+      st.falando = false;
+      console.log("[streams] terminou de falar — escutando 👂");
       return;
     }
 
@@ -844,7 +912,7 @@ wssStreams.on("connection", (ws) => {
   ws.on("close", () => {
     console.log("[streams] túnel fechado. pacotes:", st.pacotes);
     console.log("[conversa] turnos trocados:", st.historico.length);
-    if (st.destravar) clearTimeout(st.destravar);
+    if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
     if (st.dg) { try { st.dg.close(); } catch {} }
   });
   ws.on("error", (e) => console.error("[streams] erro no túnel:", e?.message));
