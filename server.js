@@ -764,3 +764,93 @@ wssStreams.on("connection", (ws) => {
       for (const b of st.fila) { try { dg.send(b); } catch {} }
       st.fila = [];
     });
+
+    dg.on("message", (raw) => {
+      let ev;
+      try { ev = JSON.parse(raw.toString()); } catch { return; }
+      if (ev.type !== "Results") return;
+      const texto = ev.channel?.alternatives?.[0]?.transcript || "";
+      if (!texto.trim()) return;
+
+      if (!ev.is_final) {
+        console.log(`[ouvido] ouvindo… "${texto}"`);
+        return;
+      }
+
+      // O BALDE: junta os pedaços até a pessoa terminar de falar
+      st.balde = (st.balde ? st.balde + " " : "") + texto.trim();
+      console.log(`[ouvido] FINAL: "${texto}"`);
+
+      if (ev.speech_final) {
+        const falaCompleta = st.balde.trim();
+        st.balde = "";
+        if (!falaCompleta) return;
+        console.log(`[ouvido] >>> pessoa disse: "${falaCompleta}"`);
+        pensarEResponder(ws, st, falaCompleta);
+      }
+    });
+
+    dg.on("error", (e) => console.error("[deepgram] erro:", e?.message));
+    dg.on("close", (code) => {
+      st.dgPronto = false;
+      console.log("[deepgram] ouvido desconectado (código", code + ")");
+    });
+  }
+
+  ws.on("message", (data) => {
+    let msg;
+    try { msg = JSON.parse(data.toString()); } catch { return; }
+
+    if (msg.event === "start") {
+      st.streamSid = msg.start?.streamSid || null;
+      st.callSid = msg.start?.callSid || null;
+      console.log("[streams] início — callSid:", st.callSid);
+      abrirOuvido();
+      // Saudação de abertura, com a voz clonada
+      st.ocupado = true;
+      st.historico.push({ role: "assistant", content: SAUDACAO_TESTE_FASE5 });
+      falarComMinhaVoz(ws, st.streamSid, SAUDACAO_TESTE_FASE5).then((ok) => {
+        if (!ok) st.ocupado = false;
+      });
+      return;
+    }
+
+    if (msg.event === "media") {
+      st.pacotes++;
+      if (st.pacotes % 400 === 0) console.log(`[streams] áudio fluindo… ${st.pacotes} pacotes`);
+      const audio = Buffer.from(msg.media.payload, "base64");
+      if (st.dgPronto) {
+        try { st.dg.send(audio); } catch {}
+      } else {
+        st.fila.push(audio);
+        if (st.fila.length > 500) st.fila.shift();
+      }
+      return;
+    }
+
+    if (msg.event === "mark") {
+      console.log("[streams] terminou de falar — pronto pra ouvir 👂");
+      if (st.destravar) clearTimeout(st.destravar);
+      st.ocupado = false;
+      return;
+    }
+
+    if (msg.event === "stop") {
+      console.log(`[streams] fim do túnel — total de pacotes: ${st.pacotes}`);
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("[streams] túnel fechado. pacotes:", st.pacotes);
+    console.log("[conversa] turnos trocados:", st.historico.length);
+    if (st.destravar) clearTimeout(st.destravar);
+    if (st.dg) { try { st.dg.close(); } catch {} }
+  });
+  ws.on("error", (e) => console.error("[streams] erro no túnel:", e?.message));
+});
+
+server.listen(PORT, () => {
+  console.log(`[VozIA] motor de voz ouvindo na porta ${PORT}`);
+  avisarFaltando();
+});
