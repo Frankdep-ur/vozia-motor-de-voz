@@ -1,8 +1,10 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 7: o motor novo passa a ler AGENTE e CONTATO do Supabase e a gravar
- *         a ligação nos Relatórios. A persona agora é editada no painel.
+ * FASE 8: pronto para produção.
+ *  - Detecção de secretária desligada (o vigia já cobre caixa postal)
+ *  - Rota de teste fechada por padrão (ligue com PERMITIR_TESTE=1)
+ *  - Cortador de frases sem folga: nada mais de monólogo
  * ---------------------------------------------------------------------------
  */
 
@@ -23,11 +25,16 @@ const ELEVENLABS_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "";
 const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS || "3", 10);
 const TRANSCRIPTION_PROVIDER = process.env.TRANSCRIPTION_PROVIDER || "Google";
-
-// Qual motor o discador usa: "streams" (novo, voz clonada) ou "relay" (antigo)
 const MOTOR_PADRAO = (process.env.MOTOR_PADRAO || "streams").toLowerCase();
 
-// --- Botões de ajuste ---
+// --- Segurança / produção ---
+// Rota /streams/teste só funciona com PERMITIR_TESTE=1 no Railway.
+const PERMITIR_TESTE = process.env.PERMITIR_TESTE === "1";
+// Detecção de secretária eletrônica. Off por padrão: causa ~3s de silêncio
+// pra quem atende, e o vigia já encerra ligação sem resposta sozinho.
+const DETECTAR_SECRETARIA = process.env.DETECTAR_SECRETARIA === "1";
+
+// --- Botões de ajuste fino ---
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "18", 10);
 const MIN_FALA_RESTO = parseInt(process.env.MIN_FALA_RESTO || "45", 10);
@@ -52,7 +59,7 @@ const twilioClient =
   process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
-// ---- Supabase com cache: evita relogar a cada ligação (economiza ~500ms) ----
+// ---- Supabase com cache ----
 let _sbCache = null, _sbQuando = 0;
 const SB_VALIDADE = 25 * 60 * 1000;
 
@@ -89,9 +96,13 @@ function avisarFaltando() {
   if (!DEEPGRAM_API_KEY) faltando.push("DEEPGRAM_API_KEY");
   if (!ELEVENLABS_API_KEY) faltando.push("ELEVENLABS_API_KEY");
   if (faltando.length) console.warn("[VozIA] Variáveis não configuradas:", faltando.join(", "));
+  if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador desprotegido!");
   console.log(
-    `[VozIA] motor padrão: ${MOTOR_PADRAO} | barge-in≥${BARGE_MIN_CHARS} | ` +
-    `fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} | flush ${FLUSH_MS}ms`
+    `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"}`
+  );
+  console.log(
+    `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} | flush ${FLUSH_MS}ms`
   );
 }
 
@@ -104,7 +115,6 @@ function preencherNome(texto = "", nome = "") {
   if (!nome) return String(texto).replace(/\[(nome|NOME|nome do contato|NOME DO CONTATO)\]/g, "").replace(/\s{2,}/g, " ");
   return String(texto).replace(/\[(nome|NOME|nome do contato|NOME DO CONTATO)\]/g, nome);
 }
-// Primeiro nome, com inicial maiúscula
 function primeiroNome(nome = "") {
   const p = String(nome).trim().split(/\s+/)[0] || "";
   return p ? p.charAt(0).toUpperCase() + p.slice(1).toLowerCase() : "";
@@ -130,29 +140,33 @@ function sanitizar(mensagens) {
   while (out.length && out[0].role !== "user") out.shift();
   return out;
 }
+
+// CORRIGIDO na Fase 8: sem folga. Nada passa acima do limite.
 function quebrarSeLonga(texto, limite = MAX_FALA) {
   if (texto.length <= limite) return [texto];
-  const partes = [];
+  // 1) tenta quebrar na vírgula
+  const porVirgula = [];
   let atual = "";
   for (const pedaco of texto.split(/,\s*/)) {
     const cand = atual ? atual + ", " + pedaco : pedaco;
     if (cand.length > limite && atual) {
-      partes.push(atual.endsWith(",") ? atual : atual + ","); atual = pedaco;
+      porVirgula.push(atual.endsWith(",") ? atual : atual + ","); atual = pedaco;
     } else atual = cand;
   }
-  if (atual) partes.push(atual);
+  if (atual) porVirgula.push(atual);
+  // 2) o que ainda passar do limite é quebrado na palavra
   const final = [];
-  for (const p of partes) {
-    if (p.length <= limite * 1.4) { final.push(p); continue; }
+  for (const p of porVirgula) {
+    if (p.length <= limite) { final.push(p); continue; }
     let linha = "";
     for (const palavra of p.split(/\s+/)) {
       if ((linha + " " + palavra).trim().length > limite && linha) {
         final.push(linha.trim()); linha = palavra;
       } else linha = (linha + " " + palavra).trim();
     }
-    if (linha) final.push(linha);
+    if (linha) final.push(linha.trim());
   }
-  return final;
+  return final.filter(Boolean);
 }
 
 async function carregarAgente(client, agenteId) {
@@ -173,7 +187,6 @@ async function carregarCampanha(client, campanhaId) {
   return data || null;
 }
 
-// ── Envelopa a persona do painel com as regras técnicas da ligação ──
 function montarPersonaStreams(agente, contato, saudacao) {
   const base = (agente?.persona_prompt || "").trim() ||
     "Você é um atendente educado e prestativo de uma empresa.";
@@ -222,7 +235,6 @@ app.use(express.json());
 
 app.get("/", (req, res) => res.send("VozIA — motor de voz online ✅"));
 
-// ---- TwiML do motor ANTIGO (Conversation Relay) ----
 app.all("/twiml", (req, res) => {
   const campanhaId = req.query.campanha_id || "";
   const contatoId = req.query.contato_id || "";
@@ -244,7 +256,6 @@ app.all("/twiml", (req, res) => {
 </Response>`);
 });
 
-// ---- TwiML do motor NOVO: agora carrega os identificadores ----
 app.all("/twiml-streams", (req, res) => {
   const host = PUBLIC_HOST || req.headers.host;
   const wsUrl = `wss://${host}/ws-streams`;
@@ -263,7 +274,6 @@ app.all("/twiml-streams", (req, res) => {
 </Response>`);
 });
 
-// ---- Discador ----
 app.post("/campanhas/iniciar", async (req, res) => {
   const auth = req.headers.authorization || "";
   if (!VOICE_BACKEND_SECRET || auth !== `Bearer ${VOICE_BACKEND_SECRET}`) {
@@ -312,10 +322,12 @@ app.post("/campanhas/iniciar", async (req, res) => {
           `&language=${enc(agente?.idioma || "pt-BR")}`;
       }
 
+      // Fase 8: sem detecção de secretária por padrão (evita ~3s de silêncio)
+      const opcoes = { to: contato.telefone, from: TWILIO_FROM, url: twimlUrl };
+      if (DETECTAR_SECRETARIA) opcoes.machineDetection = "Enable";
+
       try {
-        const call = await twilioClient.calls.create({
-          to: contato.telefone, from: TWILIO_FROM, url: twimlUrl, machineDetection: "Enable",
-        });
+        const call = await twilioClient.calls.create(opcoes);
         await supabase.from("ligacoes").insert({
           user_id: userId, campanha_id: campanhaId, contato_id: item.contato_id,
           status: "ligando", twilio_call_sid: call.sid, iniciada_em: new Date().toISOString(),
@@ -340,8 +352,12 @@ app.post("/campanhas/iniciar", async (req, res) => {
   }
 });
 
-// ---- Teste: agora aceita &agente=<id> ----
+// ---- Rota de teste: FECHADA por padrão (PERMITIR_TESTE=1 pra abrir) ----
 app.get("/streams/teste", async (req, res) => {
+  if (!PERMITIR_TESTE) {
+    console.warn("[streams/teste] tentativa de acesso com a rota fechada");
+    return res.status(404).json({ error: "não encontrado" });
+  }
   const senha = req.query.senha || "";
   if (!VOICE_BACKEND_SECRET || senha !== VOICE_BACKEND_SECRET) {
     return res.status(401).json({ error: "não autorizado" });
@@ -480,7 +496,6 @@ wss.on("connection", (ws) => {
   });
 });
 
-// ---- Gravação nos Relatórios (usada pelos DOIS motores) ----
 async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcricao, houveConversa, duracao }) {
   if (!supabase || !callSid) {
     console.log("[relatorio] ligação de teste — nada a gravar no banco");
@@ -536,9 +551,7 @@ async function falarComMinhaVoz(ws, st, texto, meuTurno) {
     return fetch(url, {
       method: "POST",
       headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt", voice_settings: vs,
-      }),
+      body: JSON.stringify({ text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt", voice_settings: vs }),
     });
   };
 
@@ -690,7 +703,6 @@ wssStreams.on("connection", (ws) => {
     historico: [], transcricao: [], turno: 0, falando: false, claudePensando: false,
     marcasPendentes: 0, podeInterromperApos: 0, streamClaude: null,
     calado_desde: Date.now(), tentativasResgate: 0, encerrando: false,
-    // Fase 7
     campanhaId: "", contatoId: "", agenteId: "",
     agente: null, contato: null, supabase: null,
     persona: "", saudacao: "", vozId: "", velocidade: 1.0,
@@ -781,7 +793,6 @@ wssStreams.on("connection", (ws) => {
     dg.on("close", (c) => { st.dgPronto = false; console.log("[deepgram] desconectado (código", c + ")"); });
   }
 
-  // Carrega agente/contato e começa a ligação
   async function iniciarConversa() {
     const t0 = Date.now();
     const sb = await getSupabaseLogado();
@@ -792,30 +803,28 @@ wssStreams.on("connection", (ws) => {
           const camp = await carregarCampanha(sb.client, st.campanhaId);
           st.agenteId = camp?.agente_id || "";
         }
-        st.agente = await carregarAgente(sb.client, st.agenteId);
-        st.contato = await carregarContato(sb.client, st.contatoId);
+        // Fase 8: carrega agente e contato em paralelo
+        const [ag, ct] = await Promise.all([
+          carregarAgente(sb.client, st.agenteId),
+          carregarContato(sb.client, st.contatoId),
+        ]);
+        st.agente = ag; st.contato = ct;
       } catch (e) { console.error("[banco] erro ao carregar contexto:", e?.message); }
     }
 
-    if (st.agente) {
-      console.log(`[agente] "${st.agente.nome}" carregado do painel em ${Date.now() - t0}ms`);
-    } else {
-      console.warn("[agente] ⚠️ nenhum agente carregado — usando padrão genérico");
-    }
+    if (st.agente) console.log(`[agente] "${st.agente.nome}" carregado do painel em ${Date.now() - t0}ms`);
+    else console.warn("[agente] ⚠️ nenhum agente carregado — usando padrão genérico");
     if (st.contato?.nome) console.log(`[contato] falando com: ${st.contato.nome}`);
 
     st.saudacao = preencherNome(
-      st.agente?.saudacao_inicial || "Olá, tudo bem? Você tem um minutinho?",
-      st.contato?.nome
+      st.agente?.saudacao_inicial || "Olá, tudo bem? Você tem um minutinho?", st.contato?.nome
     ).trim();
     st.persona = montarPersonaStreams(st.agente, st.contato, st.saudacao);
     st.vozId = resolverVoz(st.agente);
     st.velocidade = resolverVelocidade(st.agente);
     console.log(`[agente] voz ${st.vozId} | velocidade ${st.velocidade}x`);
-
-    const segEstimados = (st.saudacao.length / 16).toFixed(1);
     if (st.saudacao.length > 160) {
-      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars, ~${segEstimados}s) — considere encurtar no painel`);
+      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars) — considere encurtar no painel`);
     }
 
     abrirOuvido();
@@ -842,7 +851,7 @@ wssStreams.on("connection", (ws) => {
       await falarAvulso(ws, st, frase);
     } else {
       st.encerrando = true;
-      console.log("[vigia] sem resposta — encerrando");
+      console.log("[vigia] sem resposta (provável caixa postal) — encerrando");
       await falarAvulso(ws, st, "Parece que a ligação caiu. Vou desligar, mas fico à disposição. Um abraço!");
       await pausa(5000);
       if (twilioClient && st.callSid) {
