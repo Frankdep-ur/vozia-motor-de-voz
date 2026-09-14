@@ -1,10 +1,9 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 8: pronto para produção.
- *  - Detecção de secretária desligada (o vigia já cobre caixa postal)
- *  - Rota de teste fechada por padrão (ligue com PERMITIR_TESTE=1)
- *  - Cortador de frases sem folga: nada mais de monólogo
+ * FASE 9: lê do painel os controles de voz e de encerramento.
+ *   voz_estabilidade · voz_similaridade · voz_estilo
+ *   encerrar_automaticamente · frase_despedida · silencio_para_encerrar_segundos
  * ---------------------------------------------------------------------------
  */
 
@@ -26,21 +25,15 @@ const TWILIO_FROM = process.env.TWILIO_FROM || "";
 const MAX_CONCURRENT_CALLS = parseInt(process.env.MAX_CONCURRENT_CALLS || "3", 10);
 const TRANSCRIPTION_PROVIDER = process.env.TRANSCRIPTION_PROVIDER || "Google";
 const MOTOR_PADRAO = (process.env.MOTOR_PADRAO || "streams").toLowerCase();
-
-// --- Segurança / produção ---
-// Rota /streams/teste só funciona com PERMITIR_TESTE=1 no Railway.
 const PERMITIR_TESTE = process.env.PERMITIR_TESTE === "1";
-// Detecção de secretária eletrônica. Off por padrão: causa ~3s de silêncio
-// pra quem atende, e o vigia já encerra ligação sem resposta sozinho.
 const DETECTAR_SECRETARIA = process.env.DETECTAR_SECRETARIA === "1";
 
-// --- Botões de ajuste fino ---
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "18", 10);
 const MIN_FALA_RESTO = parseInt(process.env.MIN_FALA_RESTO || "45", 10);
 const MAX_FALA = parseInt(process.env.MAX_FALA || "110", 10);
 const DG_ENDPOINTING = parseInt(process.env.DG_ENDPOINTING || "300", 10);
-const SILENCIO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
+const SILENCIO_PADRAO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
 const FLUSH_MS = parseInt(process.env.FLUSH_MS || "900", 10);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -59,7 +52,6 @@ const twilioClient =
   process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN) : null;
 
-// ---- Supabase com cache ----
 let _sbCache = null, _sbQuando = 0;
 const SB_VALIDADE = 25 * 60 * 1000;
 
@@ -99,7 +91,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador desprotegido!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"}`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9`
   );
   console.log(
     `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} | flush ${FLUSH_MS}ms`
@@ -124,10 +116,18 @@ function resolverVoz(agente) {
   if (/^[A-Za-z0-9]{18,}$/.test(v)) return v;
   return ELEVENLABS_VOICE_ID_CLONE || ELEVENLABS_VOICE_ID;
 }
-function resolverVelocidade(agente) {
-  const v = parseFloat(agente?.velocidade_fala);
-  if (!isFinite(v)) return 1.0;
-  return Math.min(1.2, Math.max(0.7, v));
+function entre(v, min, max, padrao) {
+  const n = parseFloat(v);
+  if (!isFinite(n)) return padrao;
+  return Math.min(max, Math.max(min, n));
+}
+// FASE 9: controles de voz vindos do painel
+function resolverVozSettings(agente) {
+  return {
+    stability: entre(agente?.voz_estabilidade, 0, 1, 0.4),
+    similarity_boost: entre(agente?.voz_similaridade, 0, 1, 0.8),
+    style: entre(agente?.voz_estilo, 0, 1, 0.45),
+  };
 }
 function sanitizar(mensagens) {
   const out = [];
@@ -140,11 +140,8 @@ function sanitizar(mensagens) {
   while (out.length && out[0].role !== "user") out.shift();
   return out;
 }
-
-// CORRIGIDO na Fase 8: sem folga. Nada passa acima do limite.
 function quebrarSeLonga(texto, limite = MAX_FALA) {
   if (texto.length <= limite) return [texto];
-  // 1) tenta quebrar na vírgula
   const porVirgula = [];
   let atual = "";
   for (const pedaco of texto.split(/,\s*/)) {
@@ -154,7 +151,6 @@ function quebrarSeLonga(texto, limite = MAX_FALA) {
     } else atual = cand;
   }
   if (atual) porVirgula.push(atual);
-  // 2) o que ainda passar do limite é quebrado na palavra
   const final = [];
   for (const p of porVirgula) {
     if (p.length <= limite) { final.push(p); continue; }
@@ -195,6 +191,16 @@ function montarPersonaStreams(agente, contato, saudacao) {
     ? `O nome da pessoa com quem você está falando é ${nome}. Este nome veio do cadastro e é confiável — pode usá-lo naturalmente na conversa.`
     : `Você NÃO sabe o nome desta pessoa. Não use nome nenhum e não pergunte o nome mais de uma vez.`;
 
+  const blocoFim = agente?.encerrar_automaticamente === false ? "" : `
+
+COMO ENCERRAR A LIGAÇÃO:
+Quando o objetivo estiver cumprido, ou quando a pessoa deixar claro que não tem
+interesse, despeça-se de forma curta e simpática e escreva [FIM] no final da sua
+última frase.
+O [FIM] NÃO é falado: é um sinal para o sistema desligar o telefone.
+Use apenas UMA vez, na sua última fala, e nunca no meio da conversa.
+Exemplo: "Perfeito, vou te mandar tudo pelo WhatsApp. Obrigado e até logo! [FIM]"`;
+
   return `${base}
 
 ════════ REGRAS TÉCNICAS DESTA LIGAÇÃO (não negociáveis) ════════
@@ -224,8 +230,7 @@ Pare o assunto anterior e responda o que foi perguntado.
 
 FORMATO DA FALA (isto vira áudio, não texto):
 Números e valores por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
-Nada de listas, asteriscos, emojis ou qualquer formatação.
-Quando o objetivo da ligação for cumprido, despeça-se de forma curta e simpática.`;
+Nada de listas, asteriscos, emojis ou qualquer formatação.${blocoFim}`;
 }
 
 // ----------------------- App HTTP -----------------------
@@ -322,7 +327,6 @@ app.post("/campanhas/iniciar", async (req, res) => {
           `&language=${enc(agente?.idioma || "pt-BR")}`;
       }
 
-      // Fase 8: sem detecção de secretária por padrão (evita ~3s de silêncio)
       const opcoes = { to: contato.telefone, from: TWILIO_FROM, url: twimlUrl };
       if (DETECTAR_SECRETARIA) opcoes.machineDetection = "Enable";
 
@@ -352,10 +356,9 @@ app.post("/campanhas/iniciar", async (req, res) => {
   }
 });
 
-// ---- Rota de teste: FECHADA por padrão (PERMITIR_TESTE=1 pra abrir) ----
 app.get("/streams/teste", async (req, res) => {
   if (!PERMITIR_TESTE) {
-    console.warn("[streams/teste] tentativa de acesso com a rota fechada");
+    console.warn("[streams/teste] acesso negado — rota fechada");
     return res.status(404).json({ error: "não encontrado" });
   }
   const senha = req.query.senha || "";
@@ -402,7 +405,6 @@ server.on("upgrade", (req, socket, head) => {
   else socket.destroy();
 });
 
-// ===================== MOTOR ANTIGO (Conversation Relay) =====================
 const sessions = new Map();
 
 wss.on("connection", (ws) => {
@@ -460,7 +462,7 @@ wss.on("connection", (ws) => {
         session.currentStream = stream;
         stream.on("text", (d) => {
           texto += d;
-          try { ws.send(JSON.stringify({ type: "text", token: d, last: false })); } catch {}
+          try { ws.send(JSON.stringify({ type: "text", token: d.replace(/\[FIM\]/g, ""), last: false })); } catch {}
         });
         await stream.finalMessage();
         ws.send(JSON.stringify({ type: "text", token: "", last: true }));
@@ -545,22 +547,33 @@ async function falarComMinhaVoz(ws, st, texto, meuTurno) {
   const inicio = Date.now();
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${vozId}/stream?output_format=ulaw_8000`;
 
-  const pedir = async (comVelocidade) => {
-    const vs = { stability: 0.5, similarity_boost: 0.8 };
-    if (comVelocidade && st.velocidade && st.velocidade !== 1.0) vs.speed = st.velocidade;
-    return fetch(url, {
-      method: "POST",
-      headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt", voice_settings: vs }),
-    });
+  // FASE 9: manda os controles do painel; se o modelo recusar, vai simplificando
+  const montarSettings = (nivel) => {
+    const s = st.vozSettings || { stability: 0.4, similarity_boost: 0.8, style: 0.45 };
+    if (nivel === 0) {
+      const v = { stability: s.stability, similarity_boost: s.similarity_boost, style: s.style };
+      if (st.velocidade && st.velocidade !== 1.0) v.speed = st.velocidade;
+      return v;
+    }
+    if (nivel === 1) return { stability: s.stability, similarity_boost: s.similarity_boost, style: s.style };
+    return { stability: s.stability, similarity_boost: s.similarity_boost };
   };
 
+  const pedir = (nivel) => fetch(url, {
+    method: "POST",
+    headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt",
+      voice_settings: montarSettings(nivel),
+    }),
+  });
+
   try {
-    let resp = await pedir(true);
-    if (!resp.ok && (resp.status === 400 || resp.status === 422) && st.velocidade !== 1.0) {
-      console.warn("[boca] velocidade recusada — repetindo sem ela");
-      st.velocidade = 1.0;
-      resp = await pedir(false);
+    let resp = await pedir(st.nivelVoz);
+    while (!resp.ok && (resp.status === 400 || resp.status === 422) && st.nivelVoz < 2) {
+      st.nivelVoz++;
+      console.warn(`[boca] ajuste de voz recusado — tentando nível ${st.nivelVoz}`);
+      resp = await pedir(st.nivelVoz);
     }
     if (!resp.ok) {
       const erro = await resp.text();
@@ -607,6 +620,18 @@ function calarABoca(ws, st, motivo) {
   console.log(`[barge-in] ✋ CALEI A BOCA — ${motivo}`);
 }
 
+async function desligar(st, motivo) {
+  if (st.encerrando) return;
+  st.encerrando = true;
+  console.log(`[fim] desligando — ${motivo}`);
+  if (twilioClient && st.callSid) {
+    try {
+      await twilioClient.calls(st.callSid).update({ status: "completed" });
+      console.log("[fim] ligação encerrada pelo motor ✅");
+    } catch (e) { console.error("[fim] erro ao desligar:", e?.message); }
+  }
+}
+
 async function falarAvulso(ws, st, texto) {
   st.turno++;
   const meu = st.turno;
@@ -628,11 +653,18 @@ async function pensarEResponder(ws, st, falaDoCliente) {
 
   const inicio = Date.now();
   let primeiraEm = 0, completo = "", buffer = "", pendente = "";
-  let acabouTexto = false;
+  let acabouTexto = false, pediuFim = false;
   const fila = [];
 
+  const limparMarca = (t) => {
+    if (/\[FIM\]/i.test(t)) { pediuFim = true; return t.replace(/\[FIM\]/gi, "").trim(); }
+    return t;
+  };
+
   const empurrar = (t) => {
-    pendente = pendente ? pendente + " " + t : t;
+    const limpo = limparMarca(t);
+    if (!limpo) return;
+    pendente = pendente ? pendente + " " + limpo : limpo;
     const minimo = fila.length === 0 ? MIN_FALA_PRIMEIRA : MIN_FALA_RESTO;
     if (pendente.length >= minimo) {
       for (const p of quebrarSeLonga(pendente)) fila.push(p);
@@ -676,16 +708,25 @@ async function pensarEResponder(ws, st, falaDoCliente) {
     })();
 
     await stream.finalMessage();
-    const resto = (pendente + " " + buffer).trim();
+    const resto = limparMarca((pendente + " " + buffer).trim());
     if (resto) for (const p of quebrarSeLonga(resto)) fila.push(p);
     pendente = ""; buffer = "";
     acabouTexto = true; st.claudePensando = false;
     await consumidor;
 
     if (st.turno === meuTurno && completo.trim()) {
-      st.historico.push({ role: "assistant", content: completo.trim() });
-      st.transcricao.push(`Agente: ${completo.trim()}`);
+      const limpo = completo.replace(/\[FIM\]/gi, "").trim();
+      st.historico.push({ role: "assistant", content: limpo });
+      st.transcricao.push(`Agente: ${limpo}`);
       console.log(`[cerebro] turno completo em ${Date.now() - inicio}ms`);
+    }
+
+    // FASE 9: a IA sinalizou que o objetivo acabou
+    if (pediuFim && st.encerrarAuto && st.turno === meuTurno) {
+      console.log("[fim] a IA marcou [FIM] — aguardando a fala terminar");
+      for (let i = 0; i < 60 && st.marcasPendentes > 0 && st.turno === meuTurno; i++) await pausa(500);
+      await pausa(1500);
+      if (st.turno === meuTurno) await desligar(st, "objetivo cumprido");
     }
   } catch (e) {
     if (e?.name !== "APIUserAbortError" && e?.name !== "AbortError")
@@ -706,6 +747,9 @@ wssStreams.on("connection", (ws) => {
     campanhaId: "", contatoId: "", agenteId: "",
     agente: null, contato: null, supabase: null,
     persona: "", saudacao: "", vozId: "", velocidade: 1.0,
+    // FASE 9
+    vozSettings: { stability: 0.4, similarity_boost: 0.8, style: 0.45 },
+    nivelVoz: 0, encerrarAuto: true, fraseDespedida: "", silencioMs: SILENCIO_PADRAO_MS,
     iniciadoEm: Date.now(),
   };
   console.log("[streams] túnel aberto, aguardando áudio…");
@@ -717,6 +761,7 @@ wssStreams.on("connection", (ws) => {
     st.balde = ""; st.ultimoInterim = "";
     const texto = (fala || "").trim();
     if (!texto) return;
+    if (st.encerrando) return;
     if (st.falando || st.claudePensando || st.marcasPendentes > 0) {
       console.log(`[ouvido] (ignorado, ainda falando) "${texto}"`);
       return;
@@ -768,7 +813,7 @@ wssStreams.on("connection", (ws) => {
       st.tentativasResgate = 0;
       const estaFalando = st.falando || st.marcasPendentes > 0 || st.claudePensando;
 
-      if (estaFalando && texto.length >= BARGE_MIN_CHARS) {
+      if (estaFalando && texto.length >= BARGE_MIN_CHARS && !st.encerrando) {
         if (Date.now() > st.podeInterromperApos) {
           calarABoca(ws, st, `pessoa disse: "${texto}"`);
           limparFlush(); st.balde = ""; st.ultimoInterim = "";
@@ -803,7 +848,6 @@ wssStreams.on("connection", (ws) => {
           const camp = await carregarCampanha(sb.client, st.campanhaId);
           st.agenteId = camp?.agente_id || "";
         }
-        // Fase 8: carrega agente e contato em paralelo
         const [ag, ct] = await Promise.all([
           carregarAgente(sb.client, st.agenteId),
           carregarContato(sb.client, st.contatoId),
@@ -821,10 +865,27 @@ wssStreams.on("connection", (ws) => {
     ).trim();
     st.persona = montarPersonaStreams(st.agente, st.contato, st.saudacao);
     st.vozId = resolverVoz(st.agente);
-    st.velocidade = resolverVelocidade(st.agente);
-    console.log(`[agente] voz ${st.vozId} | velocidade ${st.velocidade}x`);
+    st.velocidade = entre(st.agente?.velocidade_fala, 0.7, 1.2, 1.0);
+
+    // FASE 9 — controles vindos do painel
+    st.vozSettings = resolverVozSettings(st.agente);
+    st.encerrarAuto = st.agente?.encerrar_automaticamente !== false;
+    st.fraseDespedida = String(st.agente?.frase_despedida || "").trim() ||
+      "Obrigado pela atenção e tenha um ótimo dia!";
+    const segSilencio = parseInt(st.agente?.silencio_para_encerrar_segundos, 10);
+    st.silencioMs = isFinite(segSilencio) && segSilencio > 0
+      ? segSilencio * 1000 : SILENCIO_PADRAO_MS;
+
+    console.log(
+      `[agente] voz ${st.vozId} | vel ${st.velocidade}x | ` +
+      `estab ${st.vozSettings.stability} · simil ${st.vozSettings.similarity_boost} · estilo ${st.vozSettings.style}`
+    );
+    console.log(
+      `[agente] encerrar auto: ${st.encerrarAuto ? "sim" : "não"} | ` +
+      `silêncio ${st.silencioMs / 1000}s | despedida: "${st.fraseDespedida}"`
+    );
     if (st.saudacao.length > 160) {
-      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars) — considere encurtar no painel`);
+      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars, ~${(st.saudacao.length / 16).toFixed(0)}s) — encurte no painel`);
     }
 
     abrirOuvido();
@@ -841,7 +902,7 @@ wssStreams.on("connection", (ws) => {
     const ocupado = st.falando || st.claudePensando || st.marcasPendentes > 0;
     if (ocupado || st.balde || st.ultimoInterim) { st.calado_desde = Date.now(); return; }
     const mudoHa = Date.now() - st.calado_desde;
-    if (mudoHa < SILENCIO_MS) return;
+    if (mudoHa < st.silencioMs) return;
 
     const RESGATES = ["Alô, você ainda está aí?", "Se preferir, eu ligo em outro momento. Pode ser?"];
     if (st.tentativasResgate < RESGATES.length) {
@@ -850,14 +911,12 @@ wssStreams.on("connection", (ws) => {
       st.calado_desde = Date.now();
       await falarAvulso(ws, st, frase);
     } else {
-      st.encerrando = true;
-      console.log("[vigia] sem resposta (provável caixa postal) — encerrando");
-      await falarAvulso(ws, st, "Parece que a ligação caiu. Vou desligar, mas fico à disposição. Um abraço!");
-      await pausa(5000);
-      if (twilioClient && st.callSid) {
-        try { await twilioClient.calls(st.callSid).update({ status: "completed" }); }
-        catch (e) { console.error("[vigia] erro ao desligar:", e?.message); }
-      }
+      console.log("[vigia] sem resposta — despedindo e encerrando");
+      const marcador = st.turno;
+      await falarAvulso(ws, st, st.fraseDespedida);
+      for (let i = 0; i < 40 && st.marcasPendentes > 0; i++) await pausa(500);
+      await pausa(1500);
+      if (st.turno === marcador + 1) await desligar(st, "silêncio prolongado");
     }
   }, 2000);
 
