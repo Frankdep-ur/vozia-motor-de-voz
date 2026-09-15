@@ -1,9 +1,8 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 9: lê do painel os controles de voz e de encerramento.
- *   voz_estabilidade · voz_similaridade · voz_estilo
- *   encerrar_automaticamente · frase_despedida · silencio_para_encerrar_segundos
+ * FASE 9b: o cronômetro de fechamento de fala não reinicia mais quando o
+ *          Deepgram repete o mesmo texto — e encurta quando isso acontece.
  * ---------------------------------------------------------------------------
  */
 
@@ -35,6 +34,8 @@ const MAX_FALA = parseInt(process.env.MAX_FALA || "110", 10);
 const DG_ENDPOINTING = parseInt(process.env.DG_ENDPOINTING || "300", 10);
 const SILENCIO_PADRAO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
 const FLUSH_MS = parseInt(process.env.FLUSH_MS || "900", 10);
+// FASE 9b: espera quando o Deepgram repete o mesmo texto (sinal de que a pessoa parou)
+const FLUSH_REPETIDO_MS = parseInt(process.env.FLUSH_REPETIDO_MS || "500", 10);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
@@ -91,10 +92,11 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador desprotegido!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9b`
   );
   console.log(
-    `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} | flush ${FLUSH_MS}ms`
+    `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} ` +
+    `| flush ${FLUSH_MS}ms · repetido ${FLUSH_REPETIDO_MS}ms`
   );
 }
 
@@ -121,7 +123,6 @@ function entre(v, min, max, padrao) {
   if (!isFinite(n)) return padrao;
   return Math.min(max, Math.max(min, n));
 }
-// FASE 9: controles de voz vindos do painel
 function resolverVozSettings(agente) {
   return {
     stability: entre(agente?.voz_estabilidade, 0, 1, 0.4),
@@ -547,7 +548,6 @@ async function falarComMinhaVoz(ws, st, texto, meuTurno) {
   const inicio = Date.now();
   const url = `https://api.elevenlabs.io/v1/text-to-speech/${vozId}/stream?output_format=ulaw_8000`;
 
-  // FASE 9: manda os controles do painel; se o modelo recusar, vai simplificando
   const montarSettings = (nivel) => {
     const s = st.vozSettings || { stability: 0.4, similarity_boost: 0.8, style: 0.45 };
     if (nivel === 0) {
@@ -721,7 +721,6 @@ async function pensarEResponder(ws, st, falaDoCliente) {
       console.log(`[cerebro] turno completo em ${Date.now() - inicio}ms`);
     }
 
-    // FASE 9: a IA sinalizou que o objetivo acabou
     if (pediuFim && st.encerrarAuto && st.turno === meuTurno) {
       console.log("[fim] a IA marcou [FIM] — aguardando a fala terminar");
       for (let i = 0; i < 60 && st.marcasPendentes > 0 && st.turno === meuTurno; i++) await pausa(500);
@@ -740,14 +739,13 @@ async function pensarEResponder(ws, st, falaDoCliente) {
 wssStreams.on("connection", (ws) => {
   const st = {
     streamSid: null, callSid: null, pacotes: 0, dg: null, dgPronto: false, fila: [],
-    balde: "", ultimoInterim: "", flushTimer: null,
+    balde: "", ultimoInterim: "", flushTimer: null, repeticoes: 0,
     historico: [], transcricao: [], turno: 0, falando: false, claudePensando: false,
     marcasPendentes: 0, podeInterromperApos: 0, streamClaude: null,
     calado_desde: Date.now(), tentativasResgate: 0, encerrando: false,
     campanhaId: "", contatoId: "", agenteId: "",
     agente: null, contato: null, supabase: null,
     persona: "", saudacao: "", vozId: "", velocidade: 1.0,
-    // FASE 9
     vozSettings: { stability: 0.4, similarity_boost: 0.8, style: 0.45 },
     nivelVoz: 0, encerrarAuto: true, fraseDespedida: "", silencioMs: SILENCIO_PADRAO_MS,
     iniciadoEm: Date.now(),
@@ -758,7 +756,7 @@ wssStreams.on("connection", (ws) => {
 
   function despachar(fala, motivo) {
     limparFlush();
-    st.balde = ""; st.ultimoInterim = "";
+    st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
     const texto = (fala || "").trim();
     if (!texto) return;
     if (st.encerrando) return;
@@ -816,20 +814,32 @@ wssStreams.on("connection", (ws) => {
       if (estaFalando && texto.length >= BARGE_MIN_CHARS && !st.encerrando) {
         if (Date.now() > st.podeInterromperApos) {
           calarABoca(ws, st, `pessoa disse: "${texto}"`);
-          limparFlush(); st.balde = ""; st.ultimoInterim = "";
+          limparFlush(); st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
         } else console.log(`[barge-in] (carência) "${texto}"`);
       }
 
+      // ─────────── FASE 9b: o conserto do atraso ───────────
       if (!ev.is_final) {
+        if (texto === st.ultimoInterim) {
+          // Mesmo texto de novo: a pessoa parou de falar.
+          // NÃO reinicia o cronômetro — e encurta a espera.
+          st.repeticoes++;
+          if (st.repeticoes === 1) {
+            console.log(`[ouvido] texto estável ("${texto}") — fechando em ${FLUSH_REPETIDO_MS}ms`);
+            agendarFlush(FLUSH_REPETIDO_MS);
+          }
+          return;
+        }
         console.log(`[ouvido] ouvindo… "${texto}"`);
         st.ultimoInterim = texto;
+        st.repeticoes = 0;
         agendarFlush(FLUSH_MS * 2);
         return;
       }
 
       console.log(`[ouvido] FINAL: "${texto}"${ev.speech_final ? "  <-- terminou" : ""}`);
       st.balde = (st.balde ? st.balde + " " : "") + texto;
-      st.ultimoInterim = "";
+      st.ultimoInterim = ""; st.repeticoes = 0;
       if (ev.speech_final) despachar(st.balde, "speech_final");
       else agendarFlush(FLUSH_MS);
     });
@@ -866,8 +876,6 @@ wssStreams.on("connection", (ws) => {
     st.persona = montarPersonaStreams(st.agente, st.contato, st.saudacao);
     st.vozId = resolverVoz(st.agente);
     st.velocidade = entre(st.agente?.velocidade_fala, 0.7, 1.2, 1.0);
-
-    // FASE 9 — controles vindos do painel
     st.vozSettings = resolverVozSettings(st.agente);
     st.encerrarAuto = st.agente?.encerrar_automaticamente !== false;
     st.fraseDespedida = String(st.agente?.frase_despedida || "").trim() ||
