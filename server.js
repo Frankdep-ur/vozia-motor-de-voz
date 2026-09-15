@@ -1,10 +1,10 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 9c: - aquece a conexão com o Claude durante a saudação (mata o
- *            atraso do primeiro turno)
- *          - ignora o eco do texto que já foi despachado (mata a
- *            auto-interrupção e a resposta duplicada)
+ * FASE 9d: nenhum lead some da fila.
+ *   - Twilio avisa o desfecho de TODA ligação (/twilio/status)
+ *   - Quem não atendeu volta pra fila até esgotar max_tentativas
+ *   - Varredura resolve ligações presas em "ligando"
  * ---------------------------------------------------------------------------
  */
 
@@ -28,6 +28,8 @@ const TRANSCRIPTION_PROVIDER = process.env.TRANSCRIPTION_PROVIDER || "Google";
 const MOTOR_PADRAO = (process.env.MOTOR_PADRAO || "streams").toLowerCase();
 const PERMITIR_TESTE = process.env.PERMITIR_TESTE === "1";
 const DETECTAR_SECRETARIA = process.env.DETECTAR_SECRETARIA === "1";
+// FASE 9d: de quantos em quantos minutos considerar uma ligação "presa"
+const VARRER_MINUTOS = parseInt(process.env.VARRER_MINUTOS || "10", 10);
 
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
@@ -37,7 +39,6 @@ const DG_ENDPOINTING = parseInt(process.env.DG_ENDPOINTING || "300", 10);
 const SILENCIO_PADRAO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
 const FLUSH_MS = parseInt(process.env.FLUSH_MS || "900", 10);
 const FLUSH_REPETIDO_MS = parseInt(process.env.FLUSH_REPETIDO_MS || "500", 10);
-// FASE 9c: por quanto tempo ignorar o eco de um texto já enviado ao cérebro
 const ECO_MS = parseInt(process.env.ECO_MS || "5000", 10);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -92,15 +93,16 @@ function avisarFaltando() {
   if (!DEEPGRAM_API_KEY) faltando.push("DEEPGRAM_API_KEY");
   if (!ELEVENLABS_API_KEY) faltando.push("ELEVENLABS_API_KEY");
   if (faltando.length) console.warn("[VozIA] Variáveis não configuradas:", faltando.join(", "));
-  if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador desprotegido!");
+  if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9c`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9d`
   );
   console.log(
     `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} ` +
     `| flush ${FLUSH_MS}ms · repetido ${FLUSH_REPETIDO_MS}ms · eco ${ECO_MS}ms`
   );
+  console.log(`[VozIA] simultâneas: ${MAX_CONCURRENT_CALLS} | varredura de presas: a cada 2min (limite ${VARRER_MINUTOS}min)`);
 }
 
 // ----------------------- Utilidades -----------------------
@@ -187,54 +189,58 @@ async function carregarCampanha(client, campanhaId) {
   return data || null;
 }
 
-function montarPersonaStreams(agente, contato, saudacao) {
-  const base = (agente?.persona_prompt || "").trim() ||
-    "Você é um atendente educado e prestativo de uma empresa.";
-  const nome = primeiroNome(contato?.nome || "");
-  const blocoNome = nome
-    ? `O nome da pessoa com quem você está falando é ${nome}. Este nome veio do cadastro e é confiável — pode usá-lo naturalmente na conversa.`
-    : `Você NÃO sabe o nome desta pessoa. Não use nome nenhum e não pergunte o nome mais de uma vez.`;
+// ============================================================================
+// FASE 9d — NINGUÉM SOME DA FILA
+// ============================================================================
 
-  const blocoFim = agente?.encerrar_automaticamente === false ? "" : `
+const ROTULO_STATUS = {
+  "busy": "Ocupado",
+  "no-answer": "Não atendeu",
+  "failed": "Falha na chamada",
+  "canceled": "Cancelada",
+  "completed": "Encerrada sem conversa",
+};
 
-COMO ENCERRAR A LIGAÇÃO:
-Quando o objetivo estiver cumprido, ou quando a pessoa deixar claro que não tem
-interesse, despeça-se de forma curta e simpática e escreva [FIM] no final da sua
-última frase.
-O [FIM] NÃO é falado: é um sinal para o sistema desligar o telefone.
-Use apenas UMA vez, na sua última fala, e nunca no meio da conversa.
-Exemplo: "Perfeito, vou te mandar tudo pelo WhatsApp. Obrigado e até logo! [FIM]"`;
+// Resolve uma ligação que nunca virou conversa e devolve o contato para a fila
+async function resolverNaoAtendida(supabase, lig, motivo) {
+  try {
+    await supabase.from("ligacoes").update({
+      status: "sem_resposta",
+      resultado: motivo,
+      finalizada_em: new Date().toISOString(),
+    }).eq("id", lig.id).eq("status", "ligando");
 
-  return `${base}
+    if (!lig.campanha_id || !lig.contato_id) {
+      console.log(`[fila] ${motivo} — ligação avulsa, nada a devolver`);
+      return;
+    }
 
-════════ REGRAS TÉCNICAS DESTA LIGAÇÃO (não negociáveis) ════════
+    const { data: camp } = await supabase.from("campanhas")
+      .select("max_tentativas").eq("id", lig.campanha_id).maybeSingle();
+    const maxTent = camp?.max_tentativas ?? 2;
 
-VOCÊ JÁ FALOU ISTO ASSIM QUE A PESSOA ATENDEU:
-"${saudacao}"
-Portanto NUNCA se apresente de novo, nem diga "oi", "alô", "aqui é o" ou o nome da
-empresa outra vez. A conversa JÁ COMEÇOU. Continue de onde a pessoa respondeu.
-Se ela só disser "sim", "pode" ou "oi", vá direto ao assunto.
+    const { data: cc } = await supabase.from("campanha_contatos")
+      .select("id, tentativas, status")
+      .eq("campanha_id", lig.campanha_id)
+      .eq("contato_id", lig.contato_id)
+      .maybeSingle();
+    if (!cc) return;
+    if (cc.status !== "ligando") return;   // já resolvido por outro caminho
 
-SOBRE O NOME:
-${blocoNome}
-NUNCA chame a pessoa por um nome que você "ouviu" durante a ligação: a transcrição
-do telefone erra nomes com frequência e chamar pelo nome errado queima a ligação.
+    const tent = cc.tentativas || 0;
+    const voltaPraFila = tent < maxTent;
+    await supabase.from("campanha_contatos").update({
+      status: voltaPraFila ? "na_fila" : "sem_resposta",
+      atualizado_em: new Date().toISOString(),
+    }).eq("id", cc.id).eq("status", "ligando");
 
-TAMANHO DA RESPOSTA:
-No MÁXIMO duas frases curtas por vez. Cada frase com no máximo quinze palavras.
-Uma ideia por vez, nunca emende dois assuntos. Sempre devolva com uma pergunta curta.
-
-EXPLIQUE ANTES DE PERGUNTAR:
-Nunca peça um dado sem dar o motivo na mesma frase.
-Se a pessoa disser que não entendeu, NÃO repita a pergunta com outras palavras:
-explique o benefício em uma frase com exemplo concreto, e só depois pergunte de novo.
-
-SE TE INTERROMPEREM:
-Pare o assunto anterior e responda o que foi perguntado.
-
-FORMATO DA FALA (isto vira áudio, não texto):
-Números e valores por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
-Nada de listas, asteriscos, emojis ou qualquer formatação.${blocoFim}`;
+    console.log(
+      `[fila] ${motivo} — tentativa ${tent}/${maxTent} → ` +
+      (voltaPraFila ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas")
+    );
+  } catch (e) {
+    console.error("[fila] erro ao resolver:", e?.message);
+  }
 }
 
 // ----------------------- App HTTP -----------------------
@@ -243,6 +249,35 @@ app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.get("/", (req, res) => res.send("VozIA — motor de voz online ✅"));
+
+// FASE 9d — a Twilio avisa aqui o desfecho de TODA ligação
+app.post("/twilio/status", async (req, res) => {
+  res.status(204).end();   // responde na hora; processa depois
+
+  if (!VOICE_BACKEND_SECRET || (req.query.k || "") !== VOICE_BACKEND_SECRET) {
+    console.warn("[twilio-status] chamada sem chave válida — ignorada");
+    return;
+  }
+  const sid = req.body?.CallSid;
+  const status = String(req.body?.CallStatus || "").toLowerCase();
+  const duracao = parseInt(req.body?.CallDuration || "0", 10);
+  if (!sid) return;
+  console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)`);
+
+  try {
+    const sb = await getSupabaseLogado();
+    if (!sb) return;
+    const { data: lig } = await sb.client.from("ligacoes")
+      .select("id, status, campanha_id, contato_id")
+      .eq("twilio_call_sid", sid).maybeSingle();
+    if (!lig) return;
+    if (lig.status !== "ligando") return;   // o motor já gravou a conversa
+
+    await resolverNaoAtendida(sb.client, lig, ROTULO_STATUS[status] || "Sem conversa");
+  } catch (e) {
+    console.error("[twilio-status] erro:", e?.message);
+  }
+});
 
 app.all("/twiml", (req, res) => {
   const campanhaId = req.query.campanha_id || "";
@@ -283,6 +318,18 @@ app.all("/twiml-streams", (req, res) => {
 </Response>`);
 });
 
+// Monta as opções da chamada, já com o aviso de desfecho
+function opcoesDaChamada(telefone, twimlUrl) {
+  const o = { to: telefone, from: TWILIO_FROM, url: twimlUrl };
+  if (DETECTAR_SECRETARIA) o.machineDetection = "Enable";
+  if (PUBLIC_HOST && VOICE_BACKEND_SECRET) {
+    o.statusCallback = `https://${PUBLIC_HOST}/twilio/status?k=${encodeURIComponent(VOICE_BACKEND_SECRET)}`;
+    o.statusCallbackMethod = "POST";
+    o.statusCallbackEvent = ["completed"];
+  }
+  return o;
+}
+
 app.post("/campanhas/iniciar", async (req, res) => {
   const auth = req.headers.authorization || "";
   if (!VOICE_BACKEND_SECRET || auth !== `Bearer ${VOICE_BACKEND_SECRET}`) {
@@ -301,10 +348,31 @@ app.post("/campanhas/iniciar", async (req, res) => {
     if (!campanha) return res.status(404).json({ error: "campanha não encontrada" });
     const agente = await carregarAgente(supabase, campanha.agente_id);
 
+    // FASE 9d: não estoura o limite se ainda houver ligações no ar
+    const { count: noAr } = await supabase.from("campanha_contatos")
+      .select("id", { count: "exact", head: true })
+      .eq("campanha_id", campanhaId).eq("status", "ligando");
+    const vagas = Math.max(0, MAX_CONCURRENT_CALLS - (noAr || 0));
+    if (vagas === 0) {
+      console.log(`[discador] ${noAr} ligação(ões) ainda no ar — aguarde`);
+      return res.json({ started: true, dialed: 0, no_ar: noAr, message: "Ligações em andamento. Aguarde terminarem." });
+    }
+
     const { data: itens } = await supabase.from("campanha_contatos")
       .select("id, contato_id, status, tentativas")
-      .eq("campanha_id", campanhaId).eq("status", "na_fila").limit(MAX_CONCURRENT_CALLS);
+      .eq("campanha_id", campanhaId).eq("status", "na_fila")
+      .order("tentativas", { ascending: true })
+      .limit(vagas);
+
     if (!itens || itens.length === 0) {
+      const { count: restam } = await supabase.from("campanha_contatos")
+        .select("id", { count: "exact", head: true })
+        .eq("campanha_id", campanhaId).in("status", ["na_fila", "ligando"]);
+      if (!restam) {
+        await supabase.from("campanhas").update({ status: "concluida" }).eq("id", campanhaId);
+        console.log("[discador] 🏁 campanha concluída — fila vazia");
+        return res.json({ started: true, dialed: 0, message: "Campanha concluída." });
+      }
       return res.json({ started: true, dialed: 0, message: "Nenhum contato na fila." });
     }
 
@@ -331,11 +399,8 @@ app.post("/campanhas/iniciar", async (req, res) => {
           `&language=${enc(agente?.idioma || "pt-BR")}`;
       }
 
-      const opcoes = { to: contato.telefone, from: TWILIO_FROM, url: twimlUrl };
-      if (DETECTAR_SECRETARIA) opcoes.machineDetection = "Enable";
-
       try {
-        const call = await twilioClient.calls.create(opcoes);
+        const call = await twilioClient.calls.create(opcoesDaChamada(contato.telefone, twimlUrl));
         await supabase.from("ligacoes").insert({
           user_id: userId, campanha_id: campanhaId, contato_id: item.contato_id,
           status: "ligando", twilio_call_sid: call.sid, iniciada_em: new Date().toISOString(),
@@ -345,15 +410,24 @@ app.post("/campanhas/iniciar", async (req, res) => {
           atualizado_em: new Date().toISOString(),
         }).eq("id", item.id);
         dialed++;
-        console.log(`[discador] ligando (${MOTOR_PADRAO}) para ${contato.nome || contato.telefone}`);
+        const tent = (item.tentativas || 0) + 1;
+        console.log(`[discador] ligando para ${contato.nome || contato.telefone} (tentativa ${tent})`);
       } catch (err) {
         console.error("[discador] erro ao ligar para", contato.telefone, err?.message);
-        await supabase.from("campanha_contatos").update({ status: "falhou" }).eq("id", item.id);
+        await supabase.from("campanha_contatos")
+          .update({ status: "falhou", atualizado_em: new Date().toISOString() })
+          .eq("id", item.id);
       }
     }
 
+    // Quantos ainda faltam, pra você ver no retorno do botão
+    const { count: naFila } = await supabase.from("campanha_contatos")
+      .select("id", { count: "exact", head: true })
+      .eq("campanha_id", campanhaId).eq("status", "na_fila");
+
     await supabase.from("campanhas").update({ status: "em_andamento" }).eq("id", campanhaId);
-    res.json({ started: true, dialed, motor: MOTOR_PADRAO });
+    console.log(`[discador] ${dialed} discada(s) | ainda na fila: ${naFila}`);
+    res.json({ started: true, dialed, na_fila: naFila, motor: MOTOR_PADRAO });
   } catch (e) {
     console.error("[/campanhas/iniciar] erro:", e);
     res.status(500).json({ error: "erro ao iniciar campanha" });
@@ -396,6 +470,23 @@ app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   res.status(500).json({ error: "erro interno: " + (err?.message || "desconhecido") });
 });
+
+// FASE 9d — varredura: rede de segurança pra ligações presas em "ligando"
+setInterval(async () => {
+  try {
+    const sb = await getSupabaseLogado();
+    if (!sb) return;
+    const limite = new Date(Date.now() - VARRER_MINUTOS * 60 * 1000).toISOString();
+    const { data: presas } = await sb.client.from("ligacoes")
+      .select("id, status, campanha_id, contato_id, twilio_call_sid")
+      .eq("status", "ligando").lt("iniciada_em", limite).limit(50);
+    if (!presas || presas.length === 0) return;
+    console.log(`[varredura] 🧹 ${presas.length} ligação(ões) presa(s) há mais de ${VARRER_MINUTOS}min`);
+    for (const p of presas) await resolverNaoAtendida(sb.client, p, "Sem retorno da operadora");
+  } catch (e) {
+    console.error("[varredura] erro:", e?.message);
+  }
+}, 120000);
 
 // ----------------------- WebSocket -----------------------
 const server = http.createServer(app);
@@ -529,11 +620,31 @@ async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcr
       duracao_segundos: duracao, transcricao, resultado, sentimento, nota,
       finalizada_em: new Date().toISOString(),
     }).eq("twilio_call_sid", callSid);
+
     if (campanhaId && contatoId) {
-      await supabase.from("campanha_contatos").update({
-        status: houveConversa ? "concluida" : "sem_resposta",
-        atualizado_em: new Date().toISOString(),
-      }).eq("campanha_id", campanhaId).eq("contato_id", contatoId);
+      if (houveConversa) {
+        await supabase.from("campanha_contatos").update({
+          status: "concluida", atualizado_em: new Date().toISOString(),
+        }).eq("campanha_id", campanhaId).eq("contato_id", contatoId);
+      } else {
+        // FASE 9d: atendeu mas não falou nada → também volta pra fila se houver tentativa
+        const { data: camp } = await supabase.from("campanhas")
+          .select("max_tentativas").eq("id", campanhaId).maybeSingle();
+        const maxTent = camp?.max_tentativas ?? 2;
+        const { data: cc } = await supabase.from("campanha_contatos")
+          .select("id, tentativas").eq("campanha_id", campanhaId)
+          .eq("contato_id", contatoId).maybeSingle();
+        const tent = cc?.tentativas || 0;
+        const volta = tent < maxTent;
+        if (cc) {
+          await supabase.from("campanha_contatos").update({
+            status: volta ? "na_fila" : "sem_resposta",
+            atualizado_em: new Date().toISOString(),
+          }).eq("id", cc.id);
+          console.log(`[fila] sem conversa — tentativa ${tent}/${maxTent} → ` +
+            (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
+        }
+      }
     }
     console.log("[relatorio] ✅ ligação gravada:", callSid, `(${duracao}s)`);
   } catch (e) { console.error("[relatorio] erro ao gravar:", e?.message); }
@@ -542,17 +653,62 @@ async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcr
 // ===================== MOTOR NOVO (Media Streams) =====================
 const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// FASE 9c: abre a conexão com o Claude enquanto a saudação toca.
-// Sem isso, a PRIMEIRA resposta paga sozinha o custo do handshake.
+function montarPersonaStreams(agente, contato, saudacao) {
+  const base = (agente?.persona_prompt || "").trim() ||
+    "Você é um atendente educado e prestativo de uma empresa.";
+  const nome = primeiroNome(contato?.nome || "");
+  const blocoNome = nome
+    ? `O nome da pessoa com quem você está falando é ${nome}. Este nome veio do cadastro e é confiável — pode usá-lo naturalmente na conversa.`
+    : `Você NÃO sabe o nome desta pessoa. Não use nome nenhum e não pergunte o nome mais de uma vez.`;
+
+  const blocoFim = agente?.encerrar_automaticamente === false ? "" : `
+
+COMO ENCERRAR A LIGAÇÃO:
+Quando o objetivo estiver cumprido, ou quando a pessoa deixar claro que não tem
+interesse, despeça-se de forma curta e simpática e escreva [FIM] no final da sua
+última frase.
+O [FIM] NÃO é falado: é um sinal para o sistema desligar o telefone.
+Use apenas UMA vez, na sua última fala, e nunca no meio da conversa.
+Exemplo: "Perfeito, vou te mandar tudo pelo WhatsApp. Obrigado e até logo! [FIM]"`;
+
+  return `${base}
+
+════════ REGRAS TÉCNICAS DESTA LIGAÇÃO (não negociáveis) ════════
+
+VOCÊ JÁ FALOU ISTO ASSIM QUE A PESSOA ATENDEU:
+"${saudacao}"
+Portanto NUNCA se apresente de novo, nem diga "oi", "alô", "aqui é o" ou o nome da
+empresa outra vez. A conversa JÁ COMEÇOU. Continue de onde a pessoa respondeu.
+Se ela só disser "sim", "pode" ou "oi", vá direto ao assunto.
+
+SOBRE O NOME:
+${blocoNome}
+NUNCA chame a pessoa por um nome que você "ouviu" durante a ligação: a transcrição
+do telefone erra nomes com frequência e chamar pelo nome errado queima a ligação.
+
+TAMANHO DA RESPOSTA:
+No MÁXIMO duas frases curtas por vez. Cada frase com no máximo quinze palavras.
+Uma ideia por vez, nunca emende dois assuntos. Sempre devolva com uma pergunta curta.
+
+EXPLIQUE ANTES DE PERGUNTAR:
+Nunca peça um dado sem dar o motivo na mesma frase.
+Se a pessoa disser que não entendeu, NÃO repita a pergunta com outras palavras:
+explique o benefício em uma frase com exemplo concreto, e só depois pergunte de novo.
+
+SE TE INTERROMPEREM:
+Pare o assunto anterior e responda o que foi perguntado.
+
+FORMATO DA FALA (isto vira áudio, não texto):
+Números e valores por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
+Nada de listas, asteriscos, emojis ou qualquer formatação.${blocoFim}`;
+}
+
 function aquecerCerebro(st) {
   if (!anthropic || !st.persona) return;
   const t0 = Date.now();
   anthropic.messages
-    .create({
-      model: CLAUDE_MODEL, max_tokens: 1,
-      system: st.persona,
-      messages: [{ role: "user", content: "oi" }],
-    })
+    .create({ model: CLAUDE_MODEL, max_tokens: 1, system: st.persona,
+      messages: [{ role: "user", content: "oi" }] })
     .then(() => console.log(`[cerebro] 🔥 conexão aquecida em ${Date.now() - t0}ms`))
     .catch((e) => console.warn("[cerebro] aquecimento falhou:", e?.message));
 }
@@ -783,7 +939,6 @@ wssStreams.on("connection", (ws) => {
       console.log(`[ouvido] (ignorado, ainda falando) "${texto}"`);
       return;
     }
-    // FASE 9c: guarda o que foi enviado, pra ignorar o eco do Deepgram
     st.jaDespachado = texto;
     st.despachadoEm = Date.now();
     console.log(`[ouvido] >>> pessoa disse: "${texto}"  [${motivo}]`);
@@ -829,10 +984,7 @@ wssStreams.on("connection", (ws) => {
       const texto = (ev.channel?.alternatives?.[0]?.transcript || "").trim();
       if (!texto) return;
 
-      // ─── FASE 9c: eco do que já foi despachado. Ignora tudo. ───
-      if (texto === st.jaDespachado && Date.now() - st.despachadoEm < ECO_MS) {
-        return;
-      }
+      if (texto === st.jaDespachado && Date.now() - st.despachadoEm < ECO_MS) return;
 
       st.calado_desde = Date.now();
       st.tentativasResgate = 0;
@@ -917,14 +1069,11 @@ wssStreams.on("connection", (ws) => {
       `silêncio ${st.silencioMs / 1000}s | despedida: "${st.fraseDespedida}"`
     );
     if (st.saudacao.length > 160) {
-      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars, ~${(st.saudacao.length / 16).toFixed(0)}s) — encurte no painel`);
-    }
-    if (st.silencioMs < 7000) {
-      console.warn(`[agente] ⚠️ silêncio de ${st.silencioMs / 1000}s é curto — a pessoa pode ser cortada antes de responder`);
+      console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars) — encurte no painel`);
     }
 
     abrirOuvido();
-    aquecerCerebro(st);   // FASE 9c: abre a conexão durante a saudação
+    aquecerCerebro(st);
 
     st.turno++;
     st.falando = true;
