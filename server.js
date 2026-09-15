@@ -1,8 +1,10 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 9b: o cronômetro de fechamento de fala não reinicia mais quando o
- *          Deepgram repete o mesmo texto — e encurta quando isso acontece.
+ * FASE 9c: - aquece a conexão com o Claude durante a saudação (mata o
+ *            atraso do primeiro turno)
+ *          - ignora o eco do texto que já foi despachado (mata a
+ *            auto-interrupção e a resposta duplicada)
  * ---------------------------------------------------------------------------
  */
 
@@ -28,14 +30,15 @@ const PERMITIR_TESTE = process.env.PERMITIR_TESTE === "1";
 const DETECTAR_SECRETARIA = process.env.DETECTAR_SECRETARIA === "1";
 
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
-const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "18", 10);
+const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
 const MIN_FALA_RESTO = parseInt(process.env.MIN_FALA_RESTO || "45", 10);
 const MAX_FALA = parseInt(process.env.MAX_FALA || "110", 10);
 const DG_ENDPOINTING = parseInt(process.env.DG_ENDPOINTING || "300", 10);
 const SILENCIO_PADRAO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
 const FLUSH_MS = parseInt(process.env.FLUSH_MS || "900", 10);
-// FASE 9b: espera quando o Deepgram repete o mesmo texto (sinal de que a pessoa parou)
 const FLUSH_REPETIDO_MS = parseInt(process.env.FLUSH_REPETIDO_MS || "500", 10);
+// FASE 9c: por quanto tempo ignorar o eco de um texto já enviado ao cérebro
+const ECO_MS = parseInt(process.env.ECO_MS || "5000", 10);
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
@@ -92,11 +95,11 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador desprotegido!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9b`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 9c`
   );
   console.log(
     `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} ` +
-    `| flush ${FLUSH_MS}ms · repetido ${FLUSH_REPETIDO_MS}ms`
+    `| flush ${FLUSH_MS}ms · repetido ${FLUSH_REPETIDO_MS}ms · eco ${ECO_MS}ms`
   );
 }
 
@@ -539,6 +542,21 @@ async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcr
 // ===================== MOTOR NOVO (Media Streams) =====================
 const pausa = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// FASE 9c: abre a conexão com o Claude enquanto a saudação toca.
+// Sem isso, a PRIMEIRA resposta paga sozinha o custo do handshake.
+function aquecerCerebro(st) {
+  if (!anthropic || !st.persona) return;
+  const t0 = Date.now();
+  anthropic.messages
+    .create({
+      model: CLAUDE_MODEL, max_tokens: 1,
+      system: st.persona,
+      messages: [{ role: "user", content: "oi" }],
+    })
+    .then(() => console.log(`[cerebro] 🔥 conexão aquecida em ${Date.now() - t0}ms`))
+    .catch((e) => console.warn("[cerebro] aquecimento falhou:", e?.message));
+}
+
 async function falarComMinhaVoz(ws, st, texto, meuTurno) {
   const vozId = st.vozId || ELEVENLABS_VOICE_ID_CLONE;
   if (!ELEVENLABS_API_KEY || !vozId || !st.streamSid) {
@@ -740,6 +758,7 @@ wssStreams.on("connection", (ws) => {
   const st = {
     streamSid: null, callSid: null, pacotes: 0, dg: null, dgPronto: false, fila: [],
     balde: "", ultimoInterim: "", flushTimer: null, repeticoes: 0,
+    jaDespachado: "", despachadoEm: 0,
     historico: [], transcricao: [], turno: 0, falando: false, claudePensando: false,
     marcasPendentes: 0, podeInterromperApos: 0, streamClaude: null,
     calado_desde: Date.now(), tentativasResgate: 0, encerrando: false,
@@ -756,14 +775,17 @@ wssStreams.on("connection", (ws) => {
 
   function despachar(fala, motivo) {
     limparFlush();
-    st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
     const texto = (fala || "").trim();
+    st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
     if (!texto) return;
     if (st.encerrando) return;
     if (st.falando || st.claudePensando || st.marcasPendentes > 0) {
       console.log(`[ouvido] (ignorado, ainda falando) "${texto}"`);
       return;
     }
+    // FASE 9c: guarda o que foi enviado, pra ignorar o eco do Deepgram
+    st.jaDespachado = texto;
+    st.despachadoEm = Date.now();
     console.log(`[ouvido] >>> pessoa disse: "${texto}"  [${motivo}]`);
     pensarEResponder(ws, st, texto);
   }
@@ -807,6 +829,11 @@ wssStreams.on("connection", (ws) => {
       const texto = (ev.channel?.alternatives?.[0]?.transcript || "").trim();
       if (!texto) return;
 
+      // ─── FASE 9c: eco do que já foi despachado. Ignora tudo. ───
+      if (texto === st.jaDespachado && Date.now() - st.despachadoEm < ECO_MS) {
+        return;
+      }
+
       st.calado_desde = Date.now();
       st.tentativasResgate = 0;
       const estaFalando = st.falando || st.marcasPendentes > 0 || st.claudePensando;
@@ -818,11 +845,8 @@ wssStreams.on("connection", (ws) => {
         } else console.log(`[barge-in] (carência) "${texto}"`);
       }
 
-      // ─────────── FASE 9b: o conserto do atraso ───────────
       if (!ev.is_final) {
         if (texto === st.ultimoInterim) {
-          // Mesmo texto de novo: a pessoa parou de falar.
-          // NÃO reinicia o cronômetro — e encurta a espera.
           st.repeticoes++;
           if (st.repeticoes === 1) {
             console.log(`[ouvido] texto estável ("${texto}") — fechando em ${FLUSH_REPETIDO_MS}ms`);
@@ -895,8 +919,13 @@ wssStreams.on("connection", (ws) => {
     if (st.saudacao.length > 160) {
       console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars, ~${(st.saudacao.length / 16).toFixed(0)}s) — encurte no painel`);
     }
+    if (st.silencioMs < 7000) {
+      console.warn(`[agente] ⚠️ silêncio de ${st.silencioMs / 1000}s é curto — a pessoa pode ser cortada antes de responder`);
+    }
 
     abrirOuvido();
+    aquecerCerebro(st);   // FASE 9c: abre a conexão durante a saudação
+
     st.turno++;
     st.falando = true;
     st.podeInterromperApos = Date.now() + 1500;
