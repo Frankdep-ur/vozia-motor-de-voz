@@ -1,10 +1,12 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
- * FASE 10: velocidade.
- *   - Resposta curta de pergunta fechada ("sim", "não", "pode"...) fecha em
- *     250ms em vez de ~1,5s
- *   - Saudação gerada enquanto o telefone toca e guardada em cache
+ * FASE 11
+ *   Ouvido:   Deepgram Nova-3 pt-BR, números em palavras, termos-chave
+ *   WhatsApp: pede o número com MODO DITADO e confirma lendo de volta
+ *   Nome:     uso natural e frequente, no máximo 1 por resposta
+ *   Roteiro:  uma pergunta por vez, valor não trava a ligação
+ *   Áudio:    sem pedacinhos cortados no meio da frase
  * ---------------------------------------------------------------------------
  */
 
@@ -35,13 +37,34 @@ const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
 const MIN_FALA_RESTO = parseInt(process.env.MIN_FALA_RESTO || "45", 10);
 const MAX_FALA = parseInt(process.env.MAX_FALA || "110", 10);
+const MIN_PEDACO = parseInt(process.env.MIN_PEDACO || "22", 10);
 const DG_ENDPOINTING = parseInt(process.env.DG_ENDPOINTING || "300", 10);
 const SILENCIO_PADRAO_MS = parseInt(process.env.SILENCIO_MS || "9000", 10);
 const FLUSH_MS = parseInt(process.env.FLUSH_MS || "900", 10);
 const FLUSH_REPETIDO_MS = parseInt(process.env.FLUSH_REPETIDO_MS || "500", 10);
-const ECO_MS = parseInt(process.env.ECO_MS || "5000", 10);
-// FASE 10: espera para respostas curtas de pergunta fechada
 const FLUSH_CURTO_MS = parseInt(process.env.FLUSH_CURTO_MS || "250", 10);
+const FLUSH_VALOR_MS = parseInt(process.env.FLUSH_VALOR_MS || "400", 10);
+const ECO_MS = parseInt(process.env.ECO_MS || "5000", 10);
+
+// Ouvido
+const DG_MODEL = process.env.DG_MODEL || "nova-3";
+const DG_SMART_FORMAT = process.env.DG_SMART_FORMAT === "1";
+const DG_KEYTERMS = (process.env.DG_KEYTERMS ||
+  "cem,duzentos,trezentos,quatrocentos,quinhentos,seiscentos,setecentos,oitocentos," +
+  "novecentos,mil,reais,Invite,Invite Energy,WhatsApp,desconto,conta de luz,usina solar")
+  .split(",").map((s) => s.trim()).filter(Boolean).slice(0, 100);
+
+// WhatsApp — modo ditado
+const FLUSH_DITADO_MS = parseInt(process.env.FLUSH_DITADO_MS || "2800", 10);
+const DITADO_JANELA_MS = parseInt(process.env.DITADO_JANELA_MS || "30000", 10);
+const MAX_TENTATIVAS_NUMERO = parseInt(process.env.MAX_TENTATIVAS_NUMERO || "2", 10);
+const SAIDA_SEGURA_NUMERO =
+  "Sem problema, a equipe te liga nesse número pra confirmar o WhatsApp. Valeu e até mais!";
+
+// Roteiro
+const UMA_PERGUNTA = process.env.UMA_PERGUNTA !== "0";
+const MAX_NOME_POR_TURNO = parseInt(process.env.MAX_NOME_POR_TURNO || "1", 10);
+const MAX_USOS_NOME = parseInt(process.env.MAX_USOS_NOME || "0", 10);   // 0 = sem limite
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || "";
@@ -99,15 +122,20 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 10`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | FASE 11`
   );
   console.log(
-    `[VozIA] barge-in≥${BARGE_MIN_CHARS} | fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} ` +
-    `| flush ${FLUSH_MS}ms · repetido ${FLUSH_REPETIDO_MS}ms · curto ${FLUSH_CURTO_MS}ms · eco ${ECO_MS}ms`
+    `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
+    `| termos-chave: ${DG_MODEL.startsWith("nova-3") ? DG_KEYTERMS.length : "n/a (só nova-3)"}`
   );
   console.log(
-    `[VozIA] simultâneas: ${MAX_CONCURRENT_CALLS} | margem do callback: ${MARGEM_CALLBACK_MS}ms ` +
-    `| varredura: a cada 2min (limite ${VARRER_MINUTOS}min)`
+    `[VozIA] whatsapp: modo ditado ${FLUSH_DITADO_MS}ms, máx ${MAX_TENTATIVAS_NUMERO} tentativas ` +
+    `| nome: ${MAX_NOME_POR_TURNO} por resposta, ${MAX_USOS_NOME > 0 ? MAX_USOS_NOME + " por ligação" : "sem limite na ligação"} ` +
+    `| uma pergunta: ${UMA_PERGUNTA ? "ON" : "off"}`
+  );
+  console.log(
+    `[VozIA] flush ${FLUSH_MS} · repetido ${FLUSH_REPETIDO_MS} · curto ${FLUSH_CURTO_MS} · valor ${FLUSH_VALOR_MS}ms ` +
+    `| fala ${MIN_FALA_PRIMEIRA}/${MIN_FALA_RESTO}/${MAX_FALA} · pedaço mín ${MIN_PEDACO} | simultâneas ${MAX_CONCURRENT_CALLS}`
   );
 }
 
@@ -116,13 +144,11 @@ function escapeXml(s = "") {
   return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;").replace(/'/g, "&apos;");
 }
-function preencherNome(texto = "", nome = "") {
-  if (!nome) return String(texto).replace(/\[(nome|NOME|nome do contato|NOME DO CONTATO)\]/g, "").replace(/\s{2,}/g, " ");
-  return String(texto).replace(/\[(nome|NOME|nome do contato|NOME DO CONTATO)\]/g, nome);
-}
+// Primeiro nome. Nome "grudado" suspeito (mais de 14 letras) não é falado.
 function primeiroNome(nome = "") {
   const p = String(nome).trim().split(/\s+/)[0] || "";
-  return p ? p.charAt(0).toUpperCase() + p.slice(1).toLowerCase() : "";
+  if (!p || p.length > 14 || /\d/.test(p)) return "";
+  return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase();
 }
 function resolverVoz(agente) {
   const v = agente && agente.voz_id ? String(agente.voz_id).trim() : "";
@@ -141,7 +167,6 @@ function resolverVozSettings(agente) {
     style: entre(agente?.voz_estilo, 0, 1, 0.45),
   };
 }
-// FASE 10: uma única fonte da configuração de voz (usada no toque e na ligação)
 function configVoz(agente) {
   return {
     vozId: resolverVoz(agente),
@@ -149,10 +174,13 @@ function configVoz(agente) {
     settings: resolverVozSettings(agente),
   };
 }
+// Saudação com [nome] → primeiro nome. Sem nome, limpa a pontuação que sobra.
 function textoSaudacao(agente, contato) {
-  return preencherNome(
-    agente?.saudacao_inicial || "Olá, tudo bem? Você tem um minutinho?", contato?.nome
-  ).trim();
+  const nome = primeiroNome(contato?.nome || "");
+  let t = String(agente?.saudacao_inicial || "Olá, tudo bem? Você tem um minutinho?");
+  t = t.replace(/\[(nome|NOME|Nome|nome do contato|NOME DO CONTATO)\]/g, nome);
+  t = t.replace(/,\s*([!?.])/g, "$1").replace(/\s+([,!?.])/g, "$1").replace(/\s{2,}/g, " ").trim();
+  return t;
 }
 function sanitizar(mensagens) {
   const out = [];
@@ -165,6 +193,18 @@ function sanitizar(mensagens) {
   while (out.length && out[0].role !== "user") out.shift();
   return out;
 }
+
+// Cola pedacinhos no vizinho (acaba o "de usina" / "solar,")
+function juntarRabos(partes, min = MIN_PEDACO) {
+  const out = [];
+  for (const p of partes) {
+    if (out.length && p.length < min) out[out.length - 1] += " " + p;
+    else out.push(p);
+  }
+  if (out.length > 1 && out[0].length < min) { out[1] = out[0] + " " + out[1]; out.shift(); }
+  return out;
+}
+
 function quebrarSeLonga(texto, limite = MAX_FALA) {
   if (texto.length <= limite) return [texto];
   const porVirgula = [];
@@ -187,29 +227,64 @@ function quebrarSeLonga(texto, limite = MAX_FALA) {
     }
     if (linha) final.push(linha.trim());
   }
-  return final.filter(Boolean);
+  return juntarRabos(final.filter(Boolean));
 }
 
-// ===== FASE 10: reconhece resposta curta de pergunta fechada =====
+// ----- Respostas curtas de pergunta fechada -----
 const RESPOSTAS_CURTAS = new Set([
   "sim", "nao", "pode", "ok", "okay", "claro", "isso", "exato", "exatamente",
   "certo", "ta", "beleza", "quero", "tenho", "e", "faz", "entendi", "uhum", "aham",
   "correto", "perfeito", "entendo", "verdade", "sei", "sabia", "com", "certeza",
-  "manda", "mandar", "pode", "ja", "ainda", "tambem", "nunca", "acho", "bom",
-  "legal", "otimo", "tudo", "bem", "oi", "ola", "alo", "quem", "pronto",
+  "manda", "mandar", "ja", "ainda", "legal", "otimo", "alo", "quem", "pronto",
   "positivo", "negativo", "recebo", "pago", "topo", "bora", "fechado", "show",
-  "boa", "tranquilo", "blz", "nem", "sabia", "conheco", "conhecia", "gostaria",
+  "boa", "tranquilo", "blz", "conheco", "conhecia", "gostaria", "senhor", "senhora",
 ]);
 function normalizar(t) {
   return String(t).toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ").trim();
 }
+function terminou(texto) { return /[.!?]$/.test(String(texto).trim()); }
 function ehRespostaCurta(texto) {
-  if (!/[.!?]$/.test(String(texto).trim())) return false;      // precisa ter terminado
+  if (!terminou(texto)) return false;
   const palavras = normalizar(texto).split(" ").filter(Boolean);
   if (palavras.length === 0 || palavras.length > 4) return false;
-  return palavras.every((p) => RESPOSTAS_CURTAS.has(p));       // números ficam de fora
+  return palavras.every((p) => RESPOSTAS_CURTAS.has(p));
 }
+function ehValorCompleto(texto) {
+  if (!terminou(texto)) return false;
+  return /\b(reais|real|conto|contos|pila)$/.test(normalizar(texto));
+}
+
+// ----- Nome -----
+function escaparRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+function reNome(nome) { return new RegExp(`(?<!\\p{L})${escaparRegex(nome)}(?!\\p{L})`, "giu"); }
+function contarNome(texto, nome) {
+  if (!nome) return 0;
+  return (String(texto).match(reNome(nome)) || []).length;
+}
+function limparSobra(t) {
+  t = t.replace(/\s+([.,!?])/g, "$1").replace(/,\s*,/g, ",").replace(/\s{2,}/g, " ").trim();
+  t = t.replace(/^[,\s]+/, "");
+  return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
+}
+function tirarNome(texto, nome) {
+  if (!nome) return texto;
+  const n = escaparRegex(nome);
+  const t = String(texto)
+    .replace(new RegExp(`\\s*,\\s*(?<!\\p{L})${n}(?!\\p{L})`, "giu"), "")
+    .replace(new RegExp(`(?<!\\p{L})${n}(?!\\p{L})\\s*,\\s*`, "giu"), "")
+    .replace(new RegExp(`\\s*(?<!\\p{L})${n}(?!\\p{L})`, "giu"), "");
+  return limparSobra(t);
+}
+function manterSoPrimeira(texto, nome) {
+  let visto = false;
+  const t = String(texto).replace(reNome(nome), (m) => { if (!visto) { visto = true; return m; } return ""; });
+  return limparSobra(t);
+}
+
+// ----- WhatsApp: detecta quando o Carlos pede o número -----
+const PEDE_NUMERO = /\b(qual|me\s+(passa|diz|fala|informa|manda)|pode\s+(me\s+)?(passar|dizer|falar|informar|repetir)|repete|continua)\b[^?.!]{0,60}\b(n[uú]mero|whats|whatsapp|zap|telefone|celular|resto)\b/i;
+function ehPergunta(texto) { return /\?["')\]]*\s*$/.test(String(texto)); }
 
 async function carregarAgente(client, agenteId) {
   if (!agenteId) return null;
@@ -234,47 +309,62 @@ function montarPersonaStreams(agente, contato, saudacao) {
     "Você é um atendente educado e prestativo de uma empresa.";
   const nome = primeiroNome(contato?.nome || "");
   const blocoNome = nome
-    ? `O nome da pessoa com quem você está falando é ${nome}. Este nome veio do cadastro e é confiável — pode usá-lo, com moderação.`
-    : `Você NÃO sabe o nome desta pessoa. Não use nome nenhum e não pergunte o nome mais de uma vez.`;
+    ? `O nome da pessoa é ${nome}. Veio do cadastro e é confiável. Use-o com naturalidade,
+várias vezes se fizer sentido: ao concordar com ela, antes de um pedido, ao tratar
+uma objeção. Nunca duas vezes na mesma resposta, e varie a posição — nem sempre no
+começo da frase. Nome usado com naturalidade aproxima e ajuda a convencer.`
+    : `Você NÃO sabe o nome desta pessoa. Não use nome nenhum e não pergunte o nome.`;
 
   const blocoFim = agente?.encerrar_automaticamente === false ? "" : `
 
 COMO ENCERRAR A LIGAÇÃO:
-Quando o objetivo estiver cumprido, ou quando a pessoa deixar claro que não tem
-interesse, despeça-se de forma curta e simpática e escreva [FIM] no final da sua
-última frase.
-O [FIM] NÃO é falado: é um sinal para o sistema desligar o telefone.
-Use apenas UMA vez, na sua última fala, e nunca no meio da conversa.
+Quando o objetivo estiver cumprido, ou a pessoa deixar claro que não tem interesse,
+despeça-se em UMA frase curta e escreva [FIM] no final dela.
+O [FIM] NÃO é falado: é o sinal para o sistema desligar.
 Exemplo: "Fechado, te mando agora. Valeu e até mais! [FIM]"`;
 
   return `${base}
 
-════════ REGRAS TÉCNICAS DESTA LIGAÇÃO (não negociáveis) ════════
+════════ REGRAS TÉCNICAS DESTA LIGAÇÃO ════════
 
 VOCÊ JÁ FALOU ISTO ASSIM QUE A PESSOA ATENDEU:
 "${saudacao}"
-Portanto NUNCA se apresente de novo, nem diga "oi", "alô", "aqui é o" ou o nome da
-empresa outra vez, a não ser que a pessoa pergunte quem é. A conversa JÁ COMEÇOU.
+Não se apresente de novo, a não ser que a pessoa pergunte quem é.
 
 SOBRE O NOME:
 ${blocoNome}
-NUNCA chame a pessoa por um nome que você "ouviu" durante a ligação: a transcrição
-do telefone erra nomes com frequência e chamar pelo nome errado queima a ligação.
+Nunca use um nome que você "ouviu" na ligação: a transcrição do telefone erra nomes.
 
-TAMANHO DA RESPOSTA:
-No MÁXIMO duas frases curtas por vez. Cada frase com no máximo quinze palavras.
-Uma ideia por vez, nunca emende dois assuntos. Sempre devolva com uma pergunta curta.
+SOBRE O QUE VOCÊ OUVE:
+A transcrição do telefone às vezes erra e chega uma palavra sem sentido
+("Presidente", "Paciente"). Se a resposta não fizer sentido, NÃO repita o que ouviu.
 
-SE TE INTERROMPEREM:
-Pare o assunto anterior e responda o que foi perguntado.
+FORMATO DA FALA (isto vira áudio):
+Números por extenso. Nada de listas, asteriscos ou emojis.
 
-FORMATO DA FALA (isto vira áudio, não texto):
-Números e valores por extenso: "duzentos e cinquenta reais", nunca "R$ 250".
-Nada de listas, asteriscos, emojis ou qualquer formatação.${blocoFim}`;
+════════ REGRAS DE OURO (valem mais que tudo acima) ════════
+1. UMA pergunta por resposta. Fez a pergunta, PARE e espere a resposta.
+
+2. WHATSAPP:
+   • Primeiro confirme se o número da ligação é o WhatsApp da pessoa.
+   • Se FOR → despedida em uma frase.
+   • Se NÃO for → peça o WhatsApp com o DDD, e deixe a pessoa falar com calma.
+   • Quando receber, LEIA DE VOLTA em grupos pra confirmar, por extenso:
+     "Dezoito, nove nove sete quatro, dois sete um nove cinco. Tá certo?"
+   • Confirmou → despedida em uma frase.
+   • Não entendeu → peça UMA vez de novo: "Pode repetir, bem devagar?"
+   • Se ainda não der, NÃO insista: diga que a equipe liga nesse mesmo número
+     pra confirmar o WhatsApp, e encerre.
+
+3. VALOR DA CONTA: pergunte no máximo duas vezes. Se não entender, diga
+   "Sem problema, a simulação usa a foto da sua conta" e vá pro fechamento.
+   O valor NÃO é obrigatório.
+
+4. No máximo duas frases curtas por resposta.${blocoFim}`;
 }
 
 // ============================================================================
-// FASE 10 — A BOCA, separada em "gerar" e "enviar", com cache da saudação
+// A BOCA
 // ============================================================================
 
 async function sintetizar(texto, cfg, estado) {
@@ -293,9 +383,7 @@ async function sintetizar(texto, cfg, estado) {
   const pedir = (nivel) => fetch(url, {
     method: "POST",
     headers: { "xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt", voice_settings: montar(nivel),
-    }),
+    body: JSON.stringify({ text: texto, model_id: ELEVENLABS_MODEL, language_code: "pt", voice_settings: montar(nivel) }),
   });
   const inicio = Date.now();
   try {
@@ -351,9 +439,8 @@ async function falarComMinhaVoz(ws, st, texto, meuTurno) {
   return enviarAudio(ws, st, audio, meuTurno);
 }
 
-// Cache da saudação: guarda a PROMESSA, assim o toque e a ligação dividem a mesma geração
 const cacheSaudacao = new Map();
-const CACHE_SAUDACAO_MAX = 40;
+const CACHE_SAUDACAO_MAX = 60;
 function chaveSaudacao(cfg, texto) {
   const s = cfg.settings;
   return [cfg.vozId, ELEVENLABS_MODEL, cfg.velocidade, s.stability, s.similarity_boost, s.style, texto].join("|");
@@ -371,47 +458,34 @@ function obterSaudacao(cfg, texto, estado) {
 }
 
 // ============================================================================
-// FILA — ninguém some
+// FILA
 // ============================================================================
 
 const ROTULO_STATUS = {
-  "busy": "Ocupado",
-  "no-answer": "Não atendeu",
-  "failed": "Falha na chamada",
-  "canceled": "Cancelada",
-  "completed": "Desligou antes de atender",
+  "busy": "Ocupado", "no-answer": "Não atendeu", "failed": "Falha na chamada",
+  "canceled": "Cancelada", "completed": "Desligou antes de atender",
 };
 
 async function resolverNaoAtendida(supabase, lig, motivo) {
   try {
-    const { data: atual } = await supabase.from("ligacoes")
-      .select("status").eq("id", lig.id).maybeSingle();
+    const { data: atual } = await supabase.from("ligacoes").select("status").eq("id", lig.id).maybeSingle();
     if (!atual || atual.status !== "ligando") return;
-
     await supabase.from("ligacoes").update({
       status: "sem_resposta", resultado: motivo, finalizada_em: new Date().toISOString(),
     }).eq("id", lig.id).eq("status", "ligando");
-
-    if (!lig.campanha_id || !lig.contato_id) {
-      console.log(`[fila] ${motivo} — ligação avulsa, nada a devolver`);
-      return;
-    }
-
+    if (!lig.campanha_id || !lig.contato_id) return;
     const { data: camp } = await supabase.from("campanhas")
       .select("max_tentativas").eq("id", lig.campanha_id).maybeSingle();
     const maxTent = camp?.max_tentativas ?? 2;
-
     const { data: cc } = await supabase.from("campanha_contatos")
       .select("id, tentativas, status")
       .eq("campanha_id", lig.campanha_id).eq("contato_id", lig.contato_id).maybeSingle();
     if (!cc || cc.status !== "ligando") return;
-
     const tent = cc.tentativas || 0;
     const volta = tent < maxTent;
     await supabase.from("campanha_contatos").update({
       status: volta ? "na_fila" : "sem_resposta", atualizado_em: new Date().toISOString(),
     }).eq("id", cc.id).eq("status", "ligando");
-
     console.log(`[fila] ${motivo} — tentativa ${tent}/${maxTent} → ` +
       (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
   } catch (e) {
@@ -437,7 +511,6 @@ app.post("/twilio/status", async (req, res) => {
   const duracao = parseInt(req.body?.CallDuration || "0", 10);
   if (!sid) return;
   console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)`);
-
   if (status === "completed" && duracao > 0) {
     console.log(`[twilio-status] atendida (${duracao}s) — o motor cuida do registro`);
     return;
@@ -563,7 +636,7 @@ app.post("/campanhas/iniciar", async (req, res) => {
         twimlUrl =
           `https://${host}/twiml-streams?campanha_id=${enc(campanhaId)}` +
           `&contato_id=${enc(item.contato_id)}&agente_id=${enc(campanha.agente_id || "")}`;
-        // FASE 10: gera a saudação ENQUANTO o telefone toca
+        // gera a saudação (com o nome) enquanto o telefone toca
         if (agente) obterSaudacao(configVoz(agente), textoSaudacao(agente, contato), { nivelVoz: 0 });
       } else {
         const saudacao = textoSaudacao(agente, contato);
@@ -769,9 +842,11 @@ async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcr
   if (anthropic && houveConversa && transcricao.trim()) {
     try {
       const r = await anthropic.messages.create({
-        model: CLAUDE_MODEL, max_tokens: 250,
+        model: CLAUDE_MODEL, max_tokens: 280,
         messages: [{ role: "user", content:
-          `Abaixo está a transcrição de uma ligação de prospecção. Responda APENAS com um JSON válido, sem texto extra e sem markdown, no formato exato: {"resultado":"resumo curto do que aconteceu e qual o próximo passo","sentimento":"positivo|neutro|negativo","nota": número de 1 a 10 avaliando o quanto este contato é promissor, ou null}. Transcrição:\n\n${transcricao}` }],
+          `Abaixo está a transcrição de uma ligação de prospecção. Responda APENAS com um JSON válido, sem texto extra e sem markdown, no formato exato: {"resultado":"resumo curto do que aconteceu e qual o próximo passo","sentimento":"positivo|neutro|negativo","nota": número de 1 a 10 avaliando o quanto este contato é promissor, ou null}.
+Se a pessoa informou um número de WhatsApp diferente do número da ligação, inclua esse número no "resultado" em algarismos, no formato (DD) 9XXXX-XXXX. Se o número ficou incompleto ou confuso, diga isso claramente.
+Transcrição:\n\n${transcricao}` }],
       });
       let txt = (r.content?.[0]?.text || "").trim().replace(/^```(json)?/i, "").replace(/```$/, "").trim();
       const obj = JSON.parse(txt);
@@ -858,6 +933,40 @@ async function falarAvulso(ws, st, texto) {
   await falarComMinhaVoz(ws, st, texto, meu);
 }
 
+// Travas aplicadas a cada pedaço, antes de falar
+function aplicarTravas(st, trecho) {
+  let t = trecho;
+
+  // WhatsApp: pedido de número liga o modo ditado, com limite de tentativas
+  if (PEDE_NUMERO.test(t)) {
+    st.pedidosNumero++;
+    if (st.pedidosNumero > MAX_TENTATIVAS_NUMERO) {
+      console.warn(`[roteiro] 🚫 já pediu o número ${MAX_TENTATIVAS_NUMERO}x — saída segura`);
+      return { texto: SAIDA_SEGURA_NUMERO, encerrar: true };
+    }
+    st.modoDitado = true;
+    st.ditadoAte = Date.now() + DITADO_JANELA_MS;
+    console.log(`[roteiro] 🎙️ pediu o número (tentativa ${st.pedidosNumero}/${MAX_TENTATIVAS_NUMERO}) — modo ditado ligado`);
+  }
+
+  // Nome: natural, no máximo N por resposta (e opcionalmente N por ligação)
+  if (st.nomeCliente) {
+    const n = contarNome(t, st.nomeCliente);
+    if (n > 0) {
+      const estourouTurno = st.nomeNoTurno >= MAX_NOME_POR_TURNO;
+      const estourouLigacao = MAX_USOS_NOME > 0 && st.usosNome >= MAX_USOS_NOME;
+      if (estourouTurno || estourouLigacao) {
+        t = tirarNome(t, st.nomeCliente);
+        console.log(`[roteiro] 👤 nome retirado (${estourouTurno ? "já usado nesta resposta" : "limite da ligação"})`);
+      } else {
+        if (n > 1) t = manterSoPrimeira(t, st.nomeCliente);
+        st.nomeNoTurno++; st.usosNome++;
+      }
+    }
+  }
+  return { texto: t, encerrar: false };
+}
+
 async function pensarEResponder(ws, st, falaDoCliente) {
   if (!falaDoCliente || !anthropic) return;
   st.turno++;
@@ -865,22 +974,25 @@ async function pensarEResponder(ws, st, falaDoCliente) {
   st.falando = true; st.claudePensando = true; st.marcasPendentes = 0;
   st.podeInterromperApos = Date.now() + 800;
   st.tentativasResgate = 0;
+  st.nomeNoTurno = 0;
 
   const inicio = Date.now();
-  let primeiraEm = 0, completo = "", buffer = "", pendente = "";
-  let acabouTexto = false, pediuFim = false;
+  let primeiraEm = 0, buffer = "", pendente = "";
+  let acabouTexto = false, pediuFim = false, cortou = false;
   const fila = [];
+  const falado = [];
 
   const limparMarca = (t) => {
     if (/\[FIM\]/i.test(t)) { pediuFim = true; return t.replace(/\[FIM\]/gi, "").trim(); }
     return t;
   };
   const empurrar = (t) => {
+    if (cortou) return;
     const limpo = limparMarca(t);
     if (!limpo) return;
     pendente = pendente ? pendente + " " + limpo : limpo;
     const minimo = fila.length === 0 ? MIN_FALA_PRIMEIRA : MIN_FALA_RESTO;
-    if (pendente.length >= minimo) {
+    if (pendente.length >= minimo || (UMA_PERGUNTA && ehPergunta(limpo))) {
       for (const p of quebrarSeLonga(pendente)) fila.push(p);
       pendente = "";
     }
@@ -891,12 +1003,12 @@ async function pensarEResponder(ws, st, falaDoCliente) {
     st.transcricao.push(`Cliente: ${falaDoCliente}`);
 
     const stream = anthropic.messages.stream({
-      model: CLAUDE_MODEL, max_tokens: 100, system: st.persona, messages: sanitizar(st.historico),
+      model: CLAUDE_MODEL, max_tokens: 110, system: st.persona, messages: sanitizar(st.historico),
     });
     st.streamClaude = stream;
 
     stream.on("text", (d) => {
-      buffer += d; completo += d;
+      buffer += d;
       let m;
       while ((m = buffer.match(/^([\s\S]*?[.!?…]+)(\s|$)/))) {
         empurrar(m[1].trim());
@@ -908,34 +1020,54 @@ async function pensarEResponder(ws, st, falaDoCliente) {
       let i = 0;
       while (st.turno === meuTurno) {
         if (i < fila.length) {
-          const trecho = fila[i++];
+          const { texto: trecho, encerrar } = aplicarTravas(st, fila[i++]);
+          if (!trecho) continue;
           if (!primeiraEm) {
             primeiraEm = Date.now() - inicio;
             console.log(`[cerebro] ⚡ primeira fala em ${primeiraEm}ms: "${trecho}"`);
           } else console.log(`[cerebro] continua: "${trecho}"`);
+          falado.push(trecho);
           await falarComMinhaVoz(ws, st, trecho, meuTurno);
+
+          if (encerrar) {
+            pediuFim = true; cortou = true;
+            if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
+            return;
+          }
+          if (UMA_PERGUNTA && ehPergunta(trecho)) {
+            cortou = true;
+            if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
+            if (i < fila.length || !acabouTexto) console.log("[roteiro] ✂️ parei na pergunta — uma por vez");
+            return;
+          }
         } else if (acabouTexto) return;
         else await pausa(50);
       }
       console.log("[cerebro] turno abortado");
     })();
 
-    await stream.finalMessage();
-    const resto = limparMarca((pendente + " " + buffer).trim());
-    if (resto) for (const p of quebrarSeLonga(resto)) fila.push(p);
+    try {
+      await stream.finalMessage();
+    } catch (e) {
+      if (!cortou && e?.name !== "APIUserAbortError" && e?.name !== "AbortError") throw e;
+    }
+    if (!cortou) {
+      const resto = limparMarca((pendente + " " + buffer).trim());
+      if (resto) for (const p of quebrarSeLonga(resto)) fila.push(p);
+    }
     pendente = ""; buffer = "";
     acabouTexto = true; st.claudePensando = false;
     await consumidor;
 
-    if (st.turno === meuTurno && completo.trim()) {
-      const limpo = completo.replace(/\[FIM\]/gi, "").trim();
-      st.historico.push({ role: "assistant", content: limpo });
-      st.transcricao.push(`Agente: ${limpo}`);
+    const dito = falado.join(" ").trim();
+    if (st.turno === meuTurno && dito) {
+      st.historico.push({ role: "assistant", content: dito });
+      st.transcricao.push(`Agente: ${dito}`);
       console.log(`[cerebro] turno completo em ${Date.now() - inicio}ms`);
     }
 
     if (pediuFim && st.encerrarAuto && st.turno === meuTurno) {
-      console.log("[fim] a IA marcou [FIM] — aguardando a fala terminar");
+      console.log("[fim] encerramento — aguardando a fala terminar");
       for (let i = 0; i < 60 && st.marcasPendentes > 0 && st.turno === meuTurno; i++) await pausa(500);
       await pausa(1500);
       if (st.turno === meuTurno) await desligar(st, "objetivo cumprido");
@@ -962,6 +1094,8 @@ wssStreams.on("connection", (ws) => {
     persona: "", saudacao: "", vozId: "", velocidade: 1.0,
     vozSettings: { stability: 0.4, similarity_boost: 0.8, style: 0.45 },
     nivelVoz: 0, encerrarAuto: true, fraseDespedida: "", silencioMs: SILENCIO_PADRAO_MS,
+    nomeCliente: "", usosNome: 0, nomeNoTurno: 0,
+    modoDitado: false, ditadoAte: 0, pedidosNumero: 0,
     iniciadoEm: Date.now(),
   };
   console.log("[streams] túnel aberto, aguardando áudio…");
@@ -969,6 +1103,24 @@ wssStreams.on("connection", (ws) => {
   function limparFlush() {
     if (st.flushTimer) { clearTimeout(st.flushTimer); st.flushTimer = null; }
     st.flushAte = 0;
+  }
+
+  function emDitado() {
+    if (st.modoDitado && Date.now() > st.ditadoAte) {
+      st.modoDitado = false;
+      console.log("[ouvido] 🎙️ modo ditado expirou");
+    }
+    return st.modoDitado;
+  }
+
+  // Junta o que já fechou + o que ainda está em andamento
+  function falaAcumulada() {
+    const b = (st.balde || "").trim();
+    const i = (st.ultimoInterim || "").trim();
+    if (!i) return b;
+    if (!b) return i;
+    if (b.endsWith(i)) return b;
+    return (b + " " + i).replace(/\s{2,}/g, " ").trim();
   }
 
   function despachar(fala, motivo) {
@@ -980,13 +1132,16 @@ wssStreams.on("connection", (ws) => {
       console.log(`[ouvido] (ignorado, ainda falando) "${texto}"`);
       return;
     }
+    if (st.modoDitado) {
+      st.modoDitado = false;
+      console.log(`[ouvido] 🎙️ ditado recebido: "${texto}" — modo ditado desligado`);
+    }
     st.jaDespachado = texto;
     st.despachadoEm = Date.now();
     console.log(`[ouvido] >>> pessoa disse: "${texto}"  [${motivo}]`);
     pensarEResponder(ws, st, texto);
   }
 
-  // FASE 10: soSeMaisCedo = não empurra pra frente um fechamento que já vai acontecer antes
   function agendarFlush(ms, soSeMaisCedo = false) {
     const alvo = Date.now() + ms;
     if (soSeMaisCedo && st.flushTimer && st.flushAte <= alvo) return;
@@ -994,34 +1149,43 @@ wssStreams.on("connection", (ws) => {
     st.flushAte = alvo;
     st.flushTimer = setTimeout(() => {
       st.flushTimer = null; st.flushAte = 0;
-      const fala = (st.balde || st.ultimoInterim || "").trim();
-      if (fala) despachar(fala, "fechado por tempo");
+      const fala = falaAcumulada();
+      if (fala) despachar(fala, st.modoDitado ? "fim do ditado" : "fechado por tempo");
     }, ms);
   }
 
   function abrirOuvido() {
     if (!DEEPGRAM_API_KEY) { console.error("[deepgram] chave não configurada!"); return; }
     const idioma = st.agente?.idioma || "pt-BR";
-    const url =
+    let url =
       "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1" +
-      `&language=${encodeURIComponent(idioma)}&model=nova-2` +
-      "&punctuate=true&smart_format=true" +
+      `&language=${encodeURIComponent(idioma)}&model=${encodeURIComponent(DG_MODEL)}` +
+      `&punctuate=true&smart_format=${DG_SMART_FORMAT ? "true" : "false"}` +
       `&interim_results=true&endpointing=${DG_ENDPOINTING}&utterance_end_ms=1000&vad_events=true`;
+    if (DG_MODEL.startsWith("nova-3")) {
+      for (const k of DG_KEYTERMS) url += `&keyterm=${encodeURIComponent(k)}`;
+    }
     const dg = new WebSocket(url, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
     st.dg = dg;
 
     dg.on("open", () => {
       st.dgPronto = true;
-      console.log("[deepgram] ouvido conectado ✅");
+      console.log(`[deepgram] ouvido conectado ✅ (${DG_MODEL})`);
       for (const b of st.fila) { try { dg.send(b); } catch {} }
       st.fila = [];
+    });
+
+    dg.on("unexpected-response", (req, res) => {
+      console.error(`[deepgram] ❌ recusou a conexão (HTTP ${res.statusCode}) — confira DG_MODEL e o idioma`);
     });
 
     dg.on("message", (raw) => {
       let ev;
       try { ev = JSON.parse(raw.toString()); } catch { return; }
+
       if (ev.type === "UtteranceEnd") {
-        const fala = (st.balde || st.ultimoInterim || "").trim();
+        if (emDitado()) return;   // no ditado a pessoa pausa entre os grupos
+        const fala = falaAcumulada();
         if (fala) despachar(fala, "UtteranceEnd");
         return;
       }
@@ -1042,7 +1206,18 @@ wssStreams.on("connection", (ws) => {
         } else console.log(`[barge-in] (carência) "${texto}"`);
       }
 
+      const ditado = emDitado();
+
       if (!ev.is_final) {
+        // MODO DITADO: deixa a pessoa pausar entre os grupos do número
+        if (ditado) {
+          if (texto !== st.ultimoInterim) {
+            console.log(`[ouvido] 🎙️ ditado… "${texto}"`);
+            st.ultimoInterim = texto; st.repeticoes = 0;
+            agendarFlush(FLUSH_DITADO_MS);
+          }
+          return;
+        }
         if (texto === st.ultimoInterim) {
           st.repeticoes++;
           if (st.repeticoes === 1) {
@@ -1054,10 +1229,12 @@ wssStreams.on("connection", (ws) => {
         console.log(`[ouvido] ouvindo… "${texto}"`);
         st.ultimoInterim = texto;
         st.repeticoes = 0;
-        // FASE 10: resposta curta de pergunta fechada sai quase na hora
         if (ehRespostaCurta(texto)) {
           console.log(`[ouvido] ⚡ resposta curta ("${texto}") — fechando em ${FLUSH_CURTO_MS}ms`);
           agendarFlush(FLUSH_CURTO_MS);
+        } else if (ehValorCompleto(texto)) {
+          console.log(`[ouvido] ⚡ valor completo ("${texto}") — fechando em ${FLUSH_VALOR_MS}ms`);
+          agendarFlush(FLUSH_VALOR_MS);
         } else {
           agendarFlush(FLUSH_MS * 2);
         }
@@ -1067,8 +1244,11 @@ wssStreams.on("connection", (ws) => {
       console.log(`[ouvido] FINAL: "${texto}"${ev.speech_final ? "  <-- terminou" : ""}`);
       st.balde = (st.balde ? st.balde + " " : "") + texto;
       st.ultimoInterim = ""; st.repeticoes = 0;
+
+      if (ditado) { agendarFlush(FLUSH_DITADO_MS); return; }   // ignora o "terminou" no ditado
       if (ev.speech_final) despachar(st.balde, "speech_final");
       else if (ehRespostaCurta(st.balde)) agendarFlush(FLUSH_CURTO_MS, true);
+      else if (ehValorCompleto(st.balde)) agendarFlush(FLUSH_VALOR_MS, true);
       else agendarFlush(FLUSH_MS);
     });
 
@@ -1096,7 +1276,12 @@ wssStreams.on("connection", (ws) => {
 
     if (st.agente) console.log(`[agente] "${st.agente.nome}" carregado do painel em ${Date.now() - t0}ms`);
     else console.warn("[agente] ⚠️ nenhum agente carregado — usando padrão genérico");
-    if (st.contato?.nome) console.log(`[contato] falando com: ${st.contato.nome}`);
+
+    st.nomeCliente = primeiroNome(st.contato?.nome || "");
+    if (st.contato?.nome) {
+      console.log(`[contato] falando com: ${st.contato.nome}` +
+        (st.nomeCliente ? ` (vai chamar de "${st.nomeCliente}")` : " (nome não será falado)"));
+    }
 
     st.saudacao = textoSaudacao(st.agente, st.contato);
     st.persona = montarPersonaStreams(st.agente, st.contato, st.saudacao);
@@ -1112,9 +1297,11 @@ wssStreams.on("connection", (ws) => {
       `[agente] voz ${st.vozId} | vel ${st.velocidade}x | ` +
       `estab ${st.vozSettings.stability} · simil ${st.vozSettings.similarity_boost} · estilo ${st.vozSettings.style}`
     );
-    console.log(`[agente] encerrar auto: ${st.encerrarAuto ? "sim" : "não"} | silêncio ${st.silencioMs / 1000}s`);
     if (st.saudacao.length > 160) {
       console.warn(`[agente] ⚠️ saudação longa (${st.saudacao.length} chars) — encurte no painel`);
+    }
+    if (/[%]|\d/.test(st.saudacao)) {
+      console.warn(`[agente] ⚠️ saudação tem algarismo ou "%" — escreva por extenso no painel`);
     }
 
     abrirOuvido();
@@ -1126,8 +1313,8 @@ wssStreams.on("connection", (ws) => {
     st.podeInterromperApos = Date.now() + 1500;
     st.calado_desde = Date.now();
     st.transcricao.push(`Agente: ${st.saudacao}`);
+    if (st.nomeCliente && contarNome(st.saudacao, st.nomeCliente) > 0) st.usosNome++;
 
-    // FASE 10: saudação do cache (já gerada enquanto o telefone tocava)
     const tS = Date.now();
     const { promessa, doCache } = obterSaudacao(cfg, st.saudacao, st);
     const audio = await promessa;
@@ -1138,6 +1325,7 @@ wssStreams.on("connection", (ws) => {
 
   const vigia = setInterval(async () => {
     if (st.encerrando || !st.persona) return;
+    if (st.modoDitado) { st.calado_desde = Date.now(); return; }   // não interrompe quem está ditando
     const ocupado = st.falando || st.claudePensando || st.marcasPendentes > 0;
     if (ocupado || st.balde || st.ultimoInterim) { st.calado_desde = Date.now(); return; }
     const mudoHa = Date.now() - st.calado_desde;
@@ -1203,7 +1391,7 @@ wssStreams.on("connection", (ws) => {
   ws.on("close", async () => {
     clearInterval(vigia); limparFlush();
     const duracao = Math.round((Date.now() - st.iniciadoEm) / 1000);
-    console.log(`[streams] túnel fechado (${duracao}s)`);
+    console.log(`[streams] túnel fechado (${duracao}s) | nome usado ${st.usosNome}x | número pedido ${st.pedidosNumero}x`);
     console.log("═══════ TRANSCRIÇÃO DA LIGAÇÃO ═══════");
     for (const l of st.transcricao) console.log("  " + l);
     console.log("══════════════════════════════════════");
