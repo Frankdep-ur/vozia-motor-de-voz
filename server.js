@@ -1,6 +1,11 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.3 — AJUSTES DO TESTE DE 28/09 (13h)
+ *   Abertura: se ouviu voz mas o texto do "Alô?" ainda não chegou, espera o texto
+ *     (o Deepgram demora ~1s) — no teste o Carlos começou 0,7s depois e atropelou
+ *   Regra de ouro 5: fala pronta do roteiro (explicação do desconto) sai inteira
+ * ---------------------------------------------------------------------------
  * FASE 12.2 — LIÇÕES DO PILOTO DE 28/09 (30 contatos)
  *   Espera o "alô" antes de falar (não atropela quem atende; máquina é pega
  *     antes do Carlos falar). Ninguém falou em 1,5s → começa a saudação.
@@ -91,7 +96,9 @@ const CAIXA_POSTAL_JANELA_S = parseFloat(process.env.CAIXA_POSTAL_JANELA_S || "0
 // Abertura: espera o "alô" da pessoa antes da saudação
 const ESPERAR_ALO = process.env.ESPERAR_ALO !== "0";
 const ALO_SILENCIO_MS = parseInt(process.env.ALO_SILENCIO_MS || "1500", 10); // ninguém falou → começa
-const ALO_PAUSA_MS = parseInt(process.env.ALO_PAUSA_MS || "600", 10);       // falou "alô" e parou → começa
+const ALO_PAUSA_MS = parseInt(process.env.ALO_PAUSA_MS || "500", 10);       // falou "alô" e parou → começa
+// Ouviu voz mas o texto ainda não chegou (o Deepgram demora ~1s pra mandar o "Alô?"): espera o texto
+const ALO_VOZ_SEM_TEXTO_MS = parseInt(process.env.ALO_VOZ_SEM_TEXTO_MS || "1600", 10);
 const ALO_MAX_MS = parseInt(process.env.ALO_MAX_MS || "6000", 10);          // limite da espera
 // Espera ("permaneça na linha", "aguarde") e assistente de chamadas
 const ESPERA_MAX_MS = parseInt(process.env.ESPERA_MAX_MS || "45000", 10);
@@ -222,7 +229,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.2`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.3`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -244,12 +251,12 @@ function avisarFaltando() {
   console.log(
     `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez | horário ${descricaoHorario()} (Brasília) ` +
     `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.2`
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.3`
   );
   console.log(
-    `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms)` : "fala na hora"} ` +
+    `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms, voz sem texto ${ALO_VOZ_SEM_TEXTO_MS}ms)` : "fala na hora"} ` +
     `| assistente de chamadas: se apresenta e espera até ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
-    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s | FASE 12.2`
+    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s | FASE 12.3`
   );
 }
 
@@ -698,7 +705,8 @@ números que a pessoa ditar — o sistema anota. Diga só "Anotado, obrigado!".
    "Sem problema, a simulação usa a foto da sua conta" e vá pro fechamento.
    O valor NÃO é obrigatório.
 
-5. No máximo duas frases curtas por resposta.${blocoFim}`;
+5. No máximo duas frases curtas por resposta. Quando o roteiro trouxer uma fala pronta
+   (como a explicação de como funciona o desconto), diga ela inteira, do jeito que está.${blocoFim}`;
 }
 
 // ============================================================================
@@ -1851,7 +1859,7 @@ wssStreams.on("connection", (ws) => {
     numeroEntendido: "", confirmandoNumero: false, whatsappConfirmado: "",
     caixaPostal: false, motivoSemConversa: "", naoLigarMais: false,
     // FASE 12.2: abertura, espera, assistente de chamadas, falas interrompidas
-    aguardandoAlo: false, primeiraVozEm: 0, ultimaAtividadeEm: 0, ouviuAlo: "",
+    aguardandoAlo: false, primeiraVozEm: 0, ultimaAtividadeEm: 0, ultimoTextoEm: 0, ouviuAlo: "",
     esperaAte: 0, triagem: false, triagemFeita: false,
     parcial: null, palavrasProtegidas: null, algumaVoz: false,
     fimDaFala: null,
@@ -2121,7 +2129,7 @@ wssStreams.on("connection", (ws) => {
       if (ev.type !== "Results") return;
       const { texto, fim, semTempo } = textoNovo(ev.channel?.alternatives?.[0]);
       if (!texto) return;
-      st.ultimaAtividadeEm = Date.now(); st.algumaVoz = true;
+      st.ultimaAtividadeEm = st.ultimoTextoEm = Date.now(); st.algumaVoz = true;
       if (!st.primeiraVozEm) st.primeiraVozEm = st.ultimaAtividadeEm;
       if (pegouMaquina(texto)) return;
       // sem os tempos das palavras, volta pro filtro antigo (mesmo texto em 5s)
@@ -2221,7 +2229,15 @@ wssStreams.on("connection", (ws) => {
       const agora = Date.now();
       if (agora - t0 >= ALO_MAX_MS) break;
       if (!st.primeiraVozEm && agora - t0 >= ALO_SILENCIO_MS) { motivo = "ninguém falou"; break; }
-      if (st.primeiraVozEm && agora - st.ultimaAtividadeEm >= ALO_PAUSA_MS) { motivo = "a pessoa falou"; break; }
+      if (st.primeiraVozEm) {
+        // Voz detectada mas o texto ainda não veio: o "Alô?" está a caminho — espera ele
+        // (teste de 28/09: o Carlos começou 0,7s depois da voz e atropelou o "Alô?")
+        const semTexto = !st.ultimoTextoEm;
+        if (agora - st.ultimaAtividadeEm >= (semTexto ? ALO_VOZ_SEM_TEXTO_MS : ALO_PAUSA_MS)) {
+          motivo = semTexto ? "ouvi voz, sem texto" : "a pessoa falou";
+          break;
+        }
+      }
       await pausa(40);
     }
     const segue = st.aguardandoAlo && livre();
