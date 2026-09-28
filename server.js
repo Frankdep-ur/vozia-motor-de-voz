@@ -1,6 +1,20 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.1 — DISCADOR AUTOMÁTICO
+ *   Campanha: clicou Iniciar uma vez, ela vai até o fim sozinha (3 por vez)
+ *   Nunca liga de novo pra quem já conversou com o Carlos nesta campanha
+ *   Tentativas contadas pelo histórico real (o botão Iniciar zera no painel)
+ *   Não atendeu → tenta de novo depois de 30 min (até o máximo da campanha)
+ *   Caixa postal → desliga na hora e conta como "não atendeu" (tenta de novo)
+ *   Respeita Pausar, "Não atender" e o horário (seg–sex 8h–20h, sáb 8h–14h)
+ *   Campanha de TESTE (até 3 contatos, ex.: só o seu número) funciona como antes:
+ *     Iniciar liga na hora, a qualquer hora, e dá pra repetir com Pausar → Iniciar
+ *   Campanha de verdade (4+ contatos) com Iniciar fora do horário: não liga na hora,
+ *     espera e começa sozinha quando o horário abrir
+ *   Erro da CONTA Twilio → pausa a campanha (não queima a lista como "falhou")
+ *   "Agendar para" do painel agora funciona
+ * ---------------------------------------------------------------------------
  * FASE 12
  *   Ouvido:   eco controlado pelo TEMPO do áudio (não pelo texto): "Sim" + "Sim"
  *             seguidos não somem mais, e o final repetido não interrompe o Carlos
@@ -40,6 +54,18 @@ const DETECTAR_SECRETARIA = process.env.DETECTAR_SECRETARIA === "1";
 const GRAVAR_LIGACOES = process.env.GRAVAR_LIGACOES === "1";
 const VARRER_MINUTOS = parseInt(process.env.VARRER_MINUTOS || "10", 10);
 const MARGEM_CALLBACK_MS = parseInt(process.env.MARGEM_CALLBACK_MS || "4000", 10);
+
+// Discador automático (horário de Brasília)
+const HORA_INICIO = parseFloat(process.env.HORA_INICIO || "8");          // seg–sáb
+const HORA_FIM = parseFloat(process.env.HORA_FIM || "20");               // seg–sex
+const HORA_FIM_SABADO = parseFloat(process.env.HORA_FIM_SABADO || "14");
+const LIGAR_DOMINGO = process.env.LIGAR_DOMINGO === "1";
+const RETENTAR_APOS_MIN = parseFloat(process.env.RETENTAR_APOS_MIN || "30");
+const CAMPANHA_CHECA_S = parseFloat(process.env.CAMPANHA_CHECA_S || "30");
+const PAUSA_ENTRE_LIGACOES_MS = parseInt(process.env.PAUSA_ENTRE_LIGACOES_MS || "3000", 10);
+// Caixa postal: desliga na hora e conta como "não atendeu" (volta pra fila)
+const CAIXA_POSTAL = process.env.CAIXA_POSTAL !== "0";
+const CAIXA_POSTAL_JANELA_S = parseFloat(process.env.CAIXA_POSTAL_JANELA_S || "40");
 
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
@@ -161,7 +187,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.1`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -179,6 +205,11 @@ function avisarFaltando() {
   console.log(
     `[VozIA] re-pergunta: ${REPERGUNTAR ? `ON (${REPERGUNTA_MS}ms, ou ${REPERGUNTA_VOZ_MS}ms se ouviu voz)` : "off"} ` +
     `| resposta no fim da pergunta: guarda ${JANELA_RESPOSTA_MS}ms | cérebro: limite ${CLAUDE_TIMEOUT_MS}ms pra começar a responder`
+  );
+  console.log(
+    `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez | horário ${descricaoHorario()} (Brasília) ` +
+    `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.1`
   );
 }
 
@@ -308,8 +339,28 @@ const FIM_DE_VALOR = /\b(reais|real|conto|contos|pila|cem|duzentos|trezentos|qua
 function ehValorCompleto(texto) {
   if (!terminou(texto)) return false;
   const n = normalizar(texto);
-  if (!n || n.split(" ").length > 6) return false;
+  if (!n) return false;
+  const qtd = n.split(" ").length;
+  // "em quatrocentos e cinquenta e dois reais" (7 palavras) também é valor completo
+  if (/\b(reais|real|conto|contos|pila)$/.test(n)) return qtd <= 10;
+  if (qtd > 6) return false;
   return FIM_DE_VALOR.test(n) || /\d$/.test(n);
+}
+
+// Caixa postal / recado da operadora (Vivo, Claro, TIM, Oi e saudação gravada pela pessoa).
+// Só frases que gente de verdade não fala no começo de uma ligação.
+const RE_CAIXA_POSTAL = new RegExp([
+  "\\bcaixa postal\\b", "\\bcaixa de (mensagem|mensagens|recado|recados)\\b",
+  "\\b(apos|depois do|ao ouvir o) (o )?(sinal|bip|bipe)\\b",
+  "\\bsujeit[ao] a (cobranca|tarifacao)\\b",
+  "\\b(deixe|grave) (a |o )?(sua |seu |uma |um )?(mensagem|recado)\\b",
+  "\\bdeixa (seu|sua|um|uma) (mensagem|recado)\\b",
+  "\\bfora da area de cobertura\\b", "\\bdesligado ou fora\\b",
+  "\\bprogramado para nao receber\\b",
+  "\\bnumero (que voce ligou|chamado|discado) (nao existe|esta desligado|nao esta disponivel)\\b",
+].join("|"));
+function ehCaixaPostal(texto) {
+  return RE_CAIXA_POSTAL.test(normalizar(texto));
 }
 
 // ----- Nome -----
@@ -646,12 +697,14 @@ const ROTULO_STATUS = {
 };
 
 async function resolverNaoAtendida(supabase, lig, motivo) {
+  let resolvi = false;
   try {
     const { data: atual } = await supabase.from("ligacoes").select("status").eq("id", lig.id).maybeSingle();
     if (!atual || atual.status !== "ligando") return;
     await supabase.from("ligacoes").update({
       status: "sem_resposta", resultado: motivo, finalizada_em: new Date().toISOString(),
     }).eq("id", lig.id).eq("status", "ligando");
+    resolvi = true;
     if (!lig.campanha_id || !lig.contato_id) return;
     const { data: camp } = await supabase.from("campanhas")
       .select("max_tentativas").eq("id", lig.campanha_id).maybeSingle();
@@ -669,8 +722,286 @@ async function resolverNaoAtendida(supabase, lig, motivo) {
       (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
   } catch (e) {
     console.error("[fila] erro ao resolver:", e?.message);
+  } finally {
+    // uma linha liberou: chama o próximo da campanha
+    if (resolvi && lig.campanha_id) continuarDepois(lig.campanha_id);
   }
 }
+
+// ============================================================================
+// DISCADOR — a campanha anda sozinha até o fim
+// ============================================================================
+// Quem chama discar():
+//   • o botão Iniciar do painel (POST /campanhas/iniciar)
+//   • o fim de cada ligação (continuarDepois)
+//   • o relógio, a cada CAMPANHA_CHECA_S (retentativas, agendadas, segurança)
+// Regras: no máximo MAX_CONCURRENT_CALLS no ar por campanha; nunca liga de novo
+// pra quem já conversou nesta campanha; tentativas contadas pelo histórico real
+// de ligações (o Iniciar do painel zera o status e as tentativas da fila).
+
+function agoraEmSP() {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Sao_Paulo", weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date());
+  const v = (t) => partes.find((p) => p.type === t)?.value || "";
+  const dia = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 }[v("weekday")];
+  return { dia, hora: (parseInt(v("hour"), 10) || 0) + (parseInt(v("minute"), 10) || 0) / 60 };
+}
+function dentroDoHorario() {
+  const { dia, hora } = agoraEmSP();
+  if (dia === 0) return LIGAR_DOMINGO && hora >= HORA_INICIO && hora < HORA_FIM_SABADO;
+  return hora >= HORA_INICIO && hora < (dia === 6 ? HORA_FIM_SABADO : HORA_FIM);
+}
+function fmtHora(h) {
+  return `${String(Math.floor(h)).padStart(2, "0")}:${String(Math.round((h % 1) * 60)).padStart(2, "0")}`;
+}
+function descricaoHorario() {
+  return `seg–sex ${fmtHora(HORA_INICIO)}–${fmtHora(HORA_FIM)}, sáb ${fmtHora(HORA_INICIO)}–${fmtHora(HORA_FIM_SABADO)}, ` +
+    (LIGAR_DOMINGO ? `dom ${fmtHora(HORA_INICIO)}–${fmtHora(HORA_FIM_SABADO)}` : "dom não");
+}
+
+// Uma rodada de discagem por vez em cada campanha (evita discar o mesmo contato 2x)
+const rodadaDaCampanha = new Map();
+function umaPorVez(campanhaId, tarefa) {
+  const antes = rodadaDaCampanha.get(campanhaId) || Promise.resolve();
+  const agora = antes.then(tarefa, tarefa);
+  const guarda = agora.catch(() => {});
+  rodadaDaCampanha.set(campanhaId, guarda);
+  guarda.then(() => { if (rodadaDaCampanha.get(campanhaId) === guarda) rodadaDaCampanha.delete(campanhaId); });
+  return agora;
+}
+
+async function historicoDaCampanha(supabase, campanhaId) {
+  const todas = [];
+  for (let de = 0; de < 50000; de += 1000) {
+    const { data, error } = await supabase.from("ligacoes")
+      .select("contato_id, status, iniciada_em").eq("campanha_id", campanhaId)
+      .order("iniciada_em", { ascending: true }).range(de, de + 999);
+    if (error) throw new Error("histórico de ligações: " + error.message);
+    todas.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return todas;
+}
+
+const avisoForaDoHorario = new Map();
+
+// Erros da Twilio que são da CONTA, não do número do contato
+// 20003 login · 20005 conta inativa · 20008 credencial de teste · 21210/21212 número de origem
+// 21215 permissão de país · 21219 conta de teste (só liga pra número verificado) · 10001/10002 conta
+const ERROS_DA_CONTA_TWILIO = new Set([20003, 20005, 20008, 21210, 21212, 21215, 21219, 10001, 10002]);
+function erroDaContaTwilio(http, codigo) {
+  return http === 401 || http === 403 || http === 404 || ERROS_DA_CONTA_TWILIO.has(Number(codigo));
+}
+
+async function discar(campanhaId, origem = "painel") {
+  return umaPorVez(campanhaId, async () => {
+    if (!twilioClient) return { status: 500, corpo: { error: "Twilio não configurado" } };
+    const sb = await getSupabaseLogado();
+    if (!sb) return { status: 500, corpo: { error: "login Supabase falhou" } };
+    const supabase = sb.client, userId = sb.userId;
+    const manual = origem === "painel";
+    const foraDoHorario = !dentroDoHorario();
+
+    const campanha = await carregarCampanha(supabase, campanhaId);
+    if (!campanha) return { status: 404, corpo: { error: "campanha não encontrada" } };
+    const nomeCamp = campanha.nome || campanhaId.slice(0, 8);
+    if (!manual && campanha.status !== "em_andamento") {
+      return { status: 200, corpo: { started: false, dialed: 0, message: `Campanha ${campanha.status}.` } };
+    }
+    // Campanha de TESTE = até 3 contatos (ex.: só o seu número). Funciona como antes:
+    // Iniciar liga na hora pra todos dela (a qualquer hora) e ela não se encerra sozinha,
+    // então dá pra testar de novo com Pausar → Iniciar.
+    const { count: totalContatos } = await supabase.from("campanha_contatos")
+      .select("id", { count: "exact", head: true }).eq("campanha_id", campanhaId);
+    const teste = totalContatos != null && totalContatos <= MAX_CONCURRENT_CALLS;
+
+    if (!manual && foraDoHorario) {
+      // Fila vazia: conclui mesmo fora do horário (campanha de verdade)
+      const { count: pendentes, error: erroPend } = await supabase.from("campanha_contatos")
+        .select("id", { count: "exact", head: true })
+        .eq("campanha_id", campanhaId).in("status", ["na_fila", "ligando"]);
+      if (!erroPend && pendentes === 0) {
+        if (teste) return { status: 200, corpo: { started: false, dialed: 0, message: "Campanha de teste: nada pra ligar." } };
+        await supabase.from("campanhas").update({ status: "concluida" }).eq("id", campanhaId);
+        console.log(`[discador] 🏁 "${nomeCamp}" concluída — ninguém mais pra ligar`);
+        return { status: 200, corpo: { started: true, dialed: 0, message: "Campanha concluída." } };
+      }
+      if (Date.now() - (avisoForaDoHorario.get(campanhaId) || 0) > 3600000) {
+        avisoForaDoHorario.set(campanhaId, Date.now());
+        console.log(`[discador] ⏸️ "${nomeCamp}": fora do horário (${descricaoHorario()}) — continuo quando abrir`);
+      }
+      return { status: 200, corpo: { started: false, dialed: 0, message: "Fora do horário de ligação." } };
+    }
+    // Iniciar clicado fora do horário numa campanha de verdade: ninguém é chamado agora;
+    // ela fica "em andamento" e começa sozinha quando o horário abrir.
+    if (manual && foraDoHorario && !teste) {
+      await supabase.from("campanhas").update({ status: "em_andamento" }).eq("id", campanhaId);
+      avisoForaDoHorario.set(campanhaId, Date.now());
+      console.log(`[discador] ⏸️ "${nomeCamp}": Iniciar fora do horário — ninguém foi chamado agora. ` +
+        `A campanha começa sozinha quando o horário abrir (${descricaoHorario()})`);
+      return { status: 200, corpo: { started: true, dialed: 0, message: "Fora do horário: começa sozinha quando abrir." } };
+    }
+    // Iniciar numa campanha de teste: liga de novo pra todos dela, mesmo quem já conversou
+    const religar = manual && teste;
+    const agente = await carregarAgente(supabase, campanha.agente_id);
+    const maxTent = campanha.max_tentativas ?? 2;
+
+    // Histórico real de cada contato nesta campanha
+    const hist = await historicoDaCampanha(supabase, campanhaId);
+    const porContato = new Map();
+    const limiteNoAr = Date.now() - VARRER_MINUTOS * 60 * 1000;
+    let noAr = 0;
+    for (const l of hist) {
+      if (!l.contato_id) continue;
+      const h = porContato.get(l.contato_id) || { tentativas: 0, conversou: false, noAr: false, ultima: 0 };
+      h.tentativas++;
+      const t = l.iniciada_em ? Date.parse(l.iniciada_em) : 0;
+      if (t > h.ultima) h.ultima = t;
+      if (l.status === "atendida") h.conversou = true;
+      if (l.status === "ligando" && t > limiteNoAr && !h.noAr) { h.noAr = true; noAr++; }
+      porContato.set(l.contato_id, h);
+    }
+    const vagas = Math.max(0, MAX_CONCURRENT_CALLS - noAr);
+
+    const { data: fila, error: erroFila } = await supabase.from("campanha_contatos")
+      .select("id, contato_id, status, tentativas, atualizado_em")
+      .eq("campanha_id", campanhaId).eq("status", "na_fila")
+      .order("tentativas", { ascending: true }).order("atualizado_em", { ascending: true })
+      .limit(500);
+    if (erroFila) throw new Error("fila da campanha: " + erroFila.message);
+
+    const marcar = (id, status) => supabase.from("campanha_contatos")
+      .update({ status, atualizado_em: new Date().toISOString() }).eq("id", id);
+    const escolhidos = [];
+    let esperando = 0;
+    for (const item of fila || []) {
+      const h = porContato.get(item.contato_id);
+      if (h?.noAr) continue;                                                   // está no telefone agora
+      if (!religar) {
+        if (h?.conversou) { await marcar(item.id, "concluida"); continue; }     // já falou com o Carlos
+        if (h && h.tentativas >= maxTent) { await marcar(item.id, "sem_resposta"); continue; }
+        if (h && h.tentativas > 0 && Date.now() - h.ultima < RETENTAR_APOS_MIN * 60000) { esperando++; continue; }
+      }
+      if (escolhidos.length < vagas) escolhidos.push({ item, h });
+      else esperando++;
+    }
+
+    const host = PUBLIC_HOST;
+    if (!host) return { status: 500, corpo: { error: "PUBLIC_HOST não configurado" } };
+    const enc = encodeURIComponent;
+    let dialed = 0, erroConta = "";
+    for (const { item, h } of escolhidos) {
+      const contato = await carregarContato(supabase, item.contato_id);
+      if (!contato?.telefone) {
+        await marcar(item.id, "falhou");
+        console.log(`[discador] ⚠️ contato ${item.contato_id} sem telefone — pulei`);
+        continue;
+      }
+      if (contato.status === "nao_atender") {
+        await marcar(item.id, "falhou");
+        console.log(`[discador] 🚫 ${contato.nome || contato.telefone} está como "Não atender" — pulei`);
+        continue;
+      }
+      const tentativa = (h?.tentativas || 0) + 1;
+
+      let twimlUrl;
+      if (MOTOR_PADRAO === "streams") {
+        twimlUrl =
+          `https://${host}/twiml-streams?campanha_id=${enc(campanhaId)}` +
+          `&contato_id=${enc(item.contato_id)}&agente_id=${enc(campanha.agente_id || "")}`;
+        // gera a saudação (com o nome) enquanto o telefone toca
+        if (agente) obterSaudacao(configVoz(agente), textoSaudacao(agente, contato), { nivelVoz: 0 });
+      } else {
+        const saudacao = textoSaudacao(agente, contato);
+        twimlUrl =
+          `https://${host}/twiml?campanha_id=${enc(campanhaId)}&contato_id=${enc(item.contato_id)}` +
+          `&saudacao=${enc(saudacao)}&voice=${enc(ELEVENLABS_VOICE_ID)}` +
+          `&language=${enc(agente?.idioma || "pt-BR")}`;
+      }
+
+      try {
+        const call = await twilioClient.calls.create(opcoesDaChamada(contato.telefone, twimlUrl));
+        await supabase.from("ligacoes").insert({
+          user_id: userId, campanha_id: campanhaId, contato_id: item.contato_id,
+          status: "ligando", twilio_call_sid: call.sid, iniciada_em: new Date().toISOString(),
+        });
+        await supabase.from("campanha_contatos").update({
+          status: "ligando", tentativas: tentativa, atualizado_em: new Date().toISOString(),
+        }).eq("id", item.id);
+        dialed++;
+        console.log(`[discador] ☎️ ligando para ${contato.nome || contato.telefone} ` +
+          (religar ? "(campanha de teste)" : `(tentativa ${tentativa}/${maxTent})`) + ` → [${call.sid.slice(-4)}]`);
+      } catch (err) {
+        const cod = err?.status || err?.statusCode || 0;
+        const passageiro = !cod || cod === 429 || cod >= 500;
+        if (!passageiro && erroDaContaTwilio(cod, err?.code)) {
+          // problema da CONTA (login, número de origem, conta de teste, permissão de país):
+          // pausa a campanha em vez de marcar a lista inteira como "falhou"
+          erroConta = `HTTP ${cod}, código ${err?.code || "?"}: ${err?.message}`;
+          await supabase.from("campanhas").update({ status: "pausada" }).eq("id", campanhaId);
+          console.error(`[discador] 🛑 "${nomeCamp}" PAUSADA — a Twilio recusou por um problema da CONTA (${erroConta}). ` +
+            "Nenhum contato foi marcado como falhou. Corrija na Twilio e clique Iniciar de novo.");
+          break;
+        }
+        console.error(`[discador] ❌ erro ao ligar para ${contato.nome || contato.telefone}: ${err?.message}` +
+          (passageiro ? " — tento de novo depois" : ""));
+        if (passageiro) esperando++;
+        else await marcar(item.id, "falhou");
+      }
+    }
+
+    if (erroConta) {
+      // 502 no Iniciar: o painel mostra que não iniciou (e não troca pra "em andamento")
+      return manual
+        ? { status: 502, corpo: { error: `Twilio recusou (problema da conta): ${erroConta}` } }
+        : { status: 200, corpo: { started: false, dialed, message: "Campanha pausada: erro da conta Twilio." } };
+    }
+
+    if (dialed === 0 && esperando === 0 && noAr === 0 && !teste) {
+      await supabase.from("campanhas").update({ status: "concluida" }).eq("id", campanhaId);
+      console.log(`[discador] 🏁 "${nomeCamp}" concluída — ninguém mais pra ligar`);
+      return { status: 200, corpo: { started: true, dialed: 0, message: "Campanha concluída." } };
+    }
+    if (manual) await supabase.from("campanhas").update({ status: "em_andamento" }).eq("id", campanhaId);
+    if (dialed > 0 || manual) {
+      console.log(`[discador] "${nomeCamp}" (${origem}): ${dialed} discada(s) | no ar: ${noAr + dialed} ` +
+        `| esperando: ${esperando}` +
+        (religar ? ` | 🧪 campanha de teste (até ${MAX_CONCURRENT_CALLS} contatos)` +
+          (foraDoHorario ? ": liguei mesmo fora do horário" : "") : ""));
+    }
+    return { status: 200, corpo: { started: true, dialed, no_ar: noAr + dialed, na_fila: esperando, motor: MOTOR_PADRAO } };
+  });
+}
+
+// Uma ligação terminou: depois de uma pausinha, chama o próximo da campanha
+function continuarDepois(campanhaId, ms = PAUSA_ENTRE_LIGACOES_MS) {
+  if (!campanhaId) return;
+  setTimeout(() => {
+    discar(campanhaId, "próxima").catch((e) => console.error("[discador] erro ao continuar:", e?.message || e));
+  }, ms);
+}
+
+// Relógio: retentativas no tempo certo, campanhas agendadas e rede de segurança
+setInterval(async () => {
+  try {
+    const sb = await getSupabaseLogado();
+    if (!sb || !twilioClient) return;
+    const { data: camps, error } = await sb.client.from("campanhas")
+      .select("id, nome, status, agendada_para").in("status", ["em_andamento", "agendada"]);
+    if (error) { console.error("[discador] relógio:", error.message); return; }
+    for (const c of camps || []) {
+      if (c.status === "agendada") {
+        if (!c.agendada_para || Date.parse(c.agendada_para) > Date.now() || !dentroDoHorario()) continue;
+        await sb.client.from("campanhas").update({ status: "em_andamento" }).eq("id", c.id).eq("status", "agendada");
+        console.log(`[discador] ⏰ "${c.nome || c.id}" começou no horário agendado`);
+      }
+      await discar(c.id, "relógio");
+    }
+  } catch (e) {
+    console.error("[discador] relógio:", e?.message || e);
+  }
+}, CAMPANHA_CHECA_S * 1000);
 
 // ----------------------- App HTTP -----------------------
 const app = express();
@@ -763,97 +1094,14 @@ app.post("/campanhas/iniciar", async (req, res) => {
   if (!VOICE_BACKEND_SECRET || auth !== `Bearer ${VOICE_BACKEND_SECRET}`) {
     return res.status(401).json({ error: "não autorizado" });
   }
-  if (!twilioClient) return res.status(500).json({ error: "Twilio não configurado" });
-  const sb = await getSupabaseLogado();
-  if (!sb) return res.status(500).json({ error: "login Supabase falhou" });
-  const supabase = sb.client, userId = sb.userId;
-
   const campanhaId = req.body?.campanha_id;
   if (!campanhaId) return res.status(400).json({ error: "campanha_id é obrigatório" });
-
   try {
-    const campanha = await carregarCampanha(supabase, campanhaId);
-    if (!campanha) return res.status(404).json({ error: "campanha não encontrada" });
-    const agente = await carregarAgente(supabase, campanha.agente_id);
-
-    const { count: noAr } = await supabase.from("campanha_contatos")
-      .select("id", { count: "exact", head: true })
-      .eq("campanha_id", campanhaId).eq("status", "ligando");
-    const vagas = Math.max(0, MAX_CONCURRENT_CALLS - (noAr || 0));
-    if (vagas === 0) {
-      console.log(`[discador] ${noAr} ligação(ões) ainda no ar — aguarde`);
-      return res.json({ started: true, dialed: 0, no_ar: noAr, message: "Ligações em andamento. Aguarde terminarem." });
-    }
-
-    const { data: itens } = await supabase.from("campanha_contatos")
-      .select("id, contato_id, status, tentativas")
-      .eq("campanha_id", campanhaId).eq("status", "na_fila")
-      .order("tentativas", { ascending: true }).limit(vagas);
-
-    if (!itens || itens.length === 0) {
-      const { count: restam } = await supabase.from("campanha_contatos")
-        .select("id", { count: "exact", head: true })
-        .eq("campanha_id", campanhaId).in("status", ["na_fila", "ligando"]);
-      if (!restam) {
-        await supabase.from("campanhas").update({ status: "concluida" }).eq("id", campanhaId);
-        console.log("[discador] 🏁 campanha concluída — fila vazia");
-        return res.json({ started: true, dialed: 0, message: "Campanha concluída." });
-      }
-      return res.json({ started: true, dialed: 0, message: "Nenhum contato na fila." });
-    }
-
-    const host = PUBLIC_HOST;
-    if (!host) return res.status(500).json({ error: "PUBLIC_HOST não configurado" });
-    const enc = encodeURIComponent;
-    let dialed = 0;
-
-    for (const item of itens) {
-      const contato = await carregarContato(supabase, item.contato_id);
-      if (!contato?.telefone) continue;
-
-      let twimlUrl;
-      if (MOTOR_PADRAO === "streams") {
-        twimlUrl =
-          `https://${host}/twiml-streams?campanha_id=${enc(campanhaId)}` +
-          `&contato_id=${enc(item.contato_id)}&agente_id=${enc(campanha.agente_id || "")}`;
-        // gera a saudação (com o nome) enquanto o telefone toca
-        if (agente) obterSaudacao(configVoz(agente), textoSaudacao(agente, contato), { nivelVoz: 0 });
-      } else {
-        const saudacao = textoSaudacao(agente, contato);
-        twimlUrl =
-          `https://${host}/twiml?campanha_id=${enc(campanhaId)}&contato_id=${enc(item.contato_id)}` +
-          `&saudacao=${enc(saudacao)}&voice=${enc(ELEVENLABS_VOICE_ID)}` +
-          `&language=${enc(agente?.idioma || "pt-BR")}`;
-      }
-
-      try {
-        const call = await twilioClient.calls.create(opcoesDaChamada(contato.telefone, twimlUrl));
-        await supabase.from("ligacoes").insert({
-          user_id: userId, campanha_id: campanhaId, contato_id: item.contato_id,
-          status: "ligando", twilio_call_sid: call.sid, iniciada_em: new Date().toISOString(),
-        });
-        await supabase.from("campanha_contatos").update({
-          status: "ligando", tentativas: (item.tentativas || 0) + 1,
-          atualizado_em: new Date().toISOString(),
-        }).eq("id", item.id);
-        dialed++;
-        console.log(`[discador] ligando para ${contato.nome || contato.telefone} (tentativa ${(item.tentativas || 0) + 1}) → [${call.sid.slice(-4)}]`);
-      } catch (err) {
-        console.error("[discador] erro ao ligar para", contato.telefone, err?.message);
-        await supabase.from("campanha_contatos")
-          .update({ status: "falhou", atualizado_em: new Date().toISOString() }).eq("id", item.id);
-      }
-    }
-
-    const { count: naFila } = await supabase.from("campanha_contatos")
-      .select("id", { count: "exact", head: true })
-      .eq("campanha_id", campanhaId).eq("status", "na_fila");
-
-    await supabase.from("campanhas").update({ status: "em_andamento" }).eq("id", campanhaId);
-    console.log(`[discador] ${dialed} discada(s) | ainda na fila: ${naFila}`);
-    res.json({ started: true, dialed, na_fila: naFila, motor: MOTOR_PADRAO });
+    // Disca as primeiras; depois a campanha anda sozinha (continuarDepois + relógio)
+    const r = await discar(campanhaId, "painel");
+    res.status(r.status).json(r.corpo);
   } catch (e) {
-    console.error("[/campanhas/iniciar] erro:", e);
+    console.error("[/campanhas/iniciar] erro:", e?.message || e);
     res.status(500).json({ error: "erro ao iniciar campanha" });
   }
 });
@@ -1046,6 +1294,7 @@ Transcrição:\n\n${transcricao}` }],
   // O número confirmado entra no resultado mesmo se o resumo falhar ou esquecer
   if (zapOk && !String(resultado || "").includes(zapOk)) resultado = juntarTexto(resultado, `WhatsApp confirmado: ${zapOk}.`);
   if (zapDuvida && !String(resultado || "").includes(zapDuvida)) resultado = juntarTexto(resultado, `WhatsApp NÃO confirmado: ${zapDuvida}.`);
+  if (!houveConversa && extras.motivoSemConversa && !resultado) resultado = extras.motivoSemConversa;
   if (resultado || sentimento || nota !== null) L(st, `[relatorio] resumo: ${sentimento} | nota ${nota} | ${resultado}`);
 
   try {
@@ -1073,13 +1322,15 @@ Transcrição:\n\n${transcricao}` }],
           await supabase.from("campanha_contatos").update({
             status: volta ? "na_fila" : "sem_resposta", atualizado_em: new Date().toISOString(),
           }).eq("id", cc.id);
-          L(st, `[fila] atendeu mas não falou — tentativa ${tent}/${maxTent} → ` +
+          L(st, `[fila] ${extras.motivoSemConversa ? extras.motivoSemConversa.toLowerCase() : "atendeu mas não falou"} — tentativa ${tent}/${maxTent} → ` +
             (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
         }
       }
     }
     L(st, `[relatorio] ✅ ligação gravada: ${callSid} (${duracao}s)`);
   } catch (e) { LE(st, `[relatorio] erro ao gravar: ${e?.message}`); }
+  // a linha liberou: chama o próximo da campanha
+  if (campanhaId) continuarDepois(campanhaId);
 }
 
 // ===================== MOTOR NOVO (Media Streams) =====================
@@ -1441,6 +1692,7 @@ wssStreams.on("connection", (ws) => {
     nomeCliente: "", usosNome: 0, nomeNoTurno: 0,
     modoDitado: false, ditadoAte: 0, pedidosNumero: 0,
     numeroEntendido: "", confirmandoNumero: false, whatsappConfirmado: "",
+    caixaPostal: false,
     fimDaFala: null,
   };
   L(st, "[streams] túnel aberto, aguardando áudio…");
@@ -1569,6 +1821,22 @@ wssStreams.on("connection", (ws) => {
     }, ms);
   }
 
+  // Caiu na caixa postal (ou recado da operadora): cala, desliga e NÃO conta como conversa.
+  // O contato volta pra fila e é chamado de novo mais tarde (até o máximo de tentativas).
+  function pegouCaixaPostal(texto) {
+    if (st.caixaPostal) return true;
+    if (!CAIXA_POSTAL || st.encerrando || st.fechado) return false;
+    if (Date.now() - st.iniciadoEm > CAIXA_POSTAL_JANELA_S * 1000) return false;
+    if (!ehCaixaPostal(texto) && !ehCaixaPostal(juntarTexto(st.balde, texto))) return false;
+    st.caixaPostal = true;
+    L(st, `[caixa-postal] 📭 "${texto}" — desligando (conta como não atendeu)`);
+    calarABoca(ws, st, "caixa postal");
+    limparFlush(); st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
+    st.transcricao.push("(caixa postal — desligado pelo motor)");
+    desligar(st, "caixa postal").catch(() => {});
+    return true;
+  }
+
   function aoDetectarVoz() {
     if (st.falando || st.claudePensando || st.marcasPendentes > 0) return;
     const agora = Date.now();
@@ -1622,6 +1890,7 @@ wssStreams.on("connection", (ws) => {
       if (ev.type !== "Results") return;
       const { texto, fim, semTempo } = textoNovo(ev.channel?.alternatives?.[0]);
       if (!texto) return;
+      if (pegouCaixaPostal(texto)) return;
       // sem os tempos das palavras, volta pro filtro antigo (mesmo texto em 5s)
       if (semTempo && texto === st.jaDespachado && Date.now() - st.despachadoEm < ECO_MS) return;
 
@@ -1883,11 +2152,12 @@ wssStreams.on("connection", (ws) => {
       supabase: st.campanhaId ? st.supabase : null,
       callSid: st.callSid, campanhaId: st.campanhaId, contatoId: st.contatoId,
       transcricao: st.transcricao.join("\n"),
-      houveConversa: st.historico.some((m) => m.role === "user"),
+      houveConversa: !st.caixaPostal && st.historico.some((m) => m.role === "user"),
       duracao,
       extras: {
         whatsappConfirmado: st.whatsappConfirmado,
         whatsappNaoConfirmado: st.whatsappConfirmado ? "" : st.numeroEntendido,
+        motivoSemConversa: st.caixaPostal ? "Caixa postal" : "",
       },
       st,
     });
