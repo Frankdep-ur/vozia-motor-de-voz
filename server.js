@@ -1,6 +1,26 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.2 — LIÇÕES DO PILOTO DE 28/09 (30 contatos)
+ *   Espera o "alô" antes de falar (não atropela quem atende; máquina é pega
+ *     antes do Carlos falar). Ninguém falou em 1,5s → começa a saudação.
+ *   Assistente de chamadas do celular ("se você disser seu nome e o motivo da
+ *     ligação…"): o Carlos se apresenta numa frase e espera calado. Se a pessoa
+ *     atender, repete a saudação; se "não está disponível", desliga e tenta depois
+ *   Recado da operadora ("vamos entregar o seu recado assim que o celular estiver
+ *     disponível") e caixa postal: desliga e tenta de novo depois — não conta
+ *     mais como "atendida"
+ *   "Permaneça na linha" / "aguarde": espera em silêncio (sem "cortou aqui")
+ *   Silêncio total depois da saudação: "Alô? Tá me ouvindo?" e desliga
+ *   Nunca fala marcador entre colchetes ("[AGUARDANDO]" foi falado no piloto)
+ *   Nome: não some mais no meio da frase ("O está aí?") e erro de digitação
+ *     do nome é corrigido ("Adenar" → "Ademar")
+ *   Transcrição guarda as falas interrompidas do Carlos
+ *   Ligação caiu → para de pensar e de falar na hora
+ *   Resultado claro no banco (caixa postal, recado, assistente, silêncio)
+ *   "Não me liga mais" → contato vira "Não atender" (nenhuma campanha liga de novo)
+ *   Depois da saudação espera 5,5s antes de re-perguntar (a pessoa ainda está entendendo)
+ * ---------------------------------------------------------------------------
  * FASE 12.1 — DISCADOR AUTOMÁTICO
  *   Campanha: clicou Iniciar uma vez, ela vai até o fim sozinha (3 por vez)
  *   Nunca liga de novo pra quem já conversou com o Carlos nesta campanha
@@ -63,9 +83,23 @@ const LIGAR_DOMINGO = process.env.LIGAR_DOMINGO === "1";
 const RETENTAR_APOS_MIN = parseFloat(process.env.RETENTAR_APOS_MIN || "30");
 const CAMPANHA_CHECA_S = parseFloat(process.env.CAMPANHA_CHECA_S || "30");
 const PAUSA_ENTRE_LIGACOES_MS = parseInt(process.env.PAUSA_ENTRE_LIGACOES_MS || "3000", 10);
-// Caixa postal: desliga na hora e conta como "não atendeu" (volta pra fila)
+// Caixa postal / recado da operadora / assistente de chamadas: desliga e conta como
+// "não atendeu" (volta pra fila). JANELA 0 = vale a ligação inteira.
 const CAIXA_POSTAL = process.env.CAIXA_POSTAL !== "0";
-const CAIXA_POSTAL_JANELA_S = parseFloat(process.env.CAIXA_POSTAL_JANELA_S || "40");
+const CAIXA_POSTAL_JANELA_S = parseFloat(process.env.CAIXA_POSTAL_JANELA_S || "0");
+
+// Abertura: espera o "alô" da pessoa antes da saudação
+const ESPERAR_ALO = process.env.ESPERAR_ALO !== "0";
+const ALO_SILENCIO_MS = parseInt(process.env.ALO_SILENCIO_MS || "1500", 10); // ninguém falou → começa
+const ALO_PAUSA_MS = parseInt(process.env.ALO_PAUSA_MS || "600", 10);       // falou "alô" e parou → começa
+const ALO_MAX_MS = parseInt(process.env.ALO_MAX_MS || "6000", 10);          // limite da espera
+// Espera ("permaneça na linha", "aguarde") e assistente de chamadas
+const ESPERA_MAX_MS = parseInt(process.env.ESPERA_MAX_MS || "45000", 10);
+const TRIAGEM_MAX_MS = parseInt(process.env.TRIAGEM_MAX_MS || "60000", 10);
+const FRASE_MOTIVO_TRIAGEM = process.env.FRASE_MOTIVO_TRIAGEM || "Estou ligando sobre desconto na conta de luz.";
+// Silêncio total (nunca ouviu voz): depois da re-pergunta curta, desliga
+const FRASE_ALO = "Alô? Tá me ouvindo?";
+const SILENCIO_SEM_VOZ_MS = parseInt(process.env.SILENCIO_SEM_VOZ_MS || "4000", 10);
 
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
@@ -86,6 +120,7 @@ const JANELA_RESPOSTA_MS = parseInt(process.env.JANELA_RESPOSTA_MS || "2500", 10
 const REPERGUNTAR = process.env.REPERGUNTAR !== "0";
 const REPERGUNTA_MS = parseInt(process.env.REPERGUNTA_MS || "5000", 10);
 const REPERGUNTA_VOZ_MS = parseInt(process.env.REPERGUNTA_VOZ_MS || "3000", 10);
+const REPERGUNTA_SAUDACAO_MS = parseInt(process.env.REPERGUNTA_SAUDACAO_MS || "5500", 10);
 const FRASE_REPERGUNTA = "Desculpa, acho que cortou aqui.";
 
 // Cérebro: tempo máximo até a primeira palavra do Claude
@@ -187,7 +222,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.1`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.2`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -209,7 +244,12 @@ function avisarFaltando() {
   console.log(
     `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez | horário ${descricaoHorario()} (Brasília) ` +
     `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.1`
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.2`
+  );
+  console.log(
+    `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms)` : "fala na hora"} ` +
+    `| assistente de chamadas: se apresenta e espera até ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
+    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s | FASE 12.2`
   );
 }
 
@@ -347,11 +387,12 @@ function ehValorCompleto(texto) {
   return FIM_DE_VALOR.test(n) || /\d$/.test(n);
 }
 
-// Caixa postal / recado da operadora (Vivo, Claro, TIM, Oi e saudação gravada pela pessoa).
-// Só frases que gente de verdade não fala no começo de uma ligação.
+// Máquinas que atendem no lugar da pessoa (piloto de 28/09). Só frases que gente de
+// verdade não fala numa ligação — por isso valem a ligação inteira.
 const RE_CAIXA_POSTAL = new RegExp([
   "\\bcaixa postal\\b", "\\bcaixa de (mensagem|mensagens|recado|recados)\\b",
-  "\\b(apos|depois do|ao ouvir o) (o )?(sinal|bip|bipe)\\b",
+  "\\bvoice ?mail\\b", "\\bencaminhada (para|ao|a) (o |a )?(caixa|correio de voz)\\b", "\\bcorreio de voz\\b",
+  "\\b(apos|depois do|ao ouvir o) (o )?(sinal|bip|bipe)\\b", "\\baguarde o (sinal|bip|bipe)\\b",
   "\\bsujeit[ao] a (cobranca|tarifacao)\\b",
   "\\b(deixe|grave) (a |o )?(sua |seu |uma |um )?(mensagem|recado)\\b",
   "\\bdeixa (seu|sua|um|uma) (mensagem|recado)\\b",
@@ -359,8 +400,47 @@ const RE_CAIXA_POSTAL = new RegExp([
   "\\bprogramado para nao receber\\b",
   "\\bnumero (que voce ligou|chamado|discado) (nao existe|esta desligado|nao esta disponivel)\\b",
 ].join("|"));
-function ehCaixaPostal(texto) {
-  return RE_CAIXA_POSTAL.test(normalizar(texto));
+// Serviço de recado da operadora: "Vamos entregar o seu recado assim que o celular estiver disponível"
+const RE_RECADO = /\b(vamos entregar o seu|entrego o seu recado|entregar o seu recado|assim que o (celular|telefone|aparelho) estiver|quando o (celular|telefone|aparelho) estiver disponivel)\b/;
+// Assistente de chamadas do celular: fim da triagem sem a pessoa
+const RE_INDISPONIVEL = /\b(esta pessoa nao esta disponivel|deixe outra mensagem)\b/;
+// Assistente de chamadas pedindo nome e motivo
+const RE_TRIAGEM = /\b(seu nome e o motivo|poderei ver se (esta|essa) pessoa|servico de triagem|triagem de chamadas|esta usando (o |um )?(bixby|assistente))\b/;
+// Pedido pra esperar (assistente ou gente de verdade chamando alguém)
+const RE_ESPERA = /\b(permaneca na linha|aguarde (na linha|um (momento|instante|minuto|minutinho|pouquinho))|aguarda (um|so) (pouco|pouquinho|minutinho|instante|momento)|so um (minutinho|momento|instante|segundinho)|um momentinho|vou chamar (ele|ela|o|a))\b/;
+
+// O que atendeu? "caixa" | "recado" | "indisponivel" | "triagem" | "espera" | ""
+function tipoDeMaquina(texto) {
+  const n = normalizar(texto);
+  if (!n) return "";
+  if (RE_RECADO.test(n)) return "recado";
+  if (RE_INDISPONIVEL.test(n)) return "indisponivel";
+  if (RE_CAIXA_POSTAL.test(n)) return "caixa";
+  if (RE_TRIAGEM.test(n)) return "triagem";
+  if (RE_ESPERA.test(n)) return "espera";
+  return "";
+}
+const MOTIVO_MAQUINA = {
+  caixa: "Caixa postal",
+  recado: "Recado da operadora (celular indisponível)",
+  indisponivel: "Assistente de chamadas: pessoa indisponível",
+};
+// Pediu pra não ligar mais → contato vira "Não atender" no painel (nenhuma campanha liga de novo)
+const RE_NAO_LIGAR = /\b(nao (me )?(liga|ligue|ligar|ligam|telefona) mais|para(r)? de (me )?ligar|nao quero (mais )?(receber )?(ligacao|ligacoes)|nao quero que (voces |vc )?(me )?liguem|(tira|tirar|remove|remover|apaga|apagar) (o )?(meu (numero|nome|telefone|contato)|eu) d(a|essa|esta) (sua )?lista|nao me ligue)\b/;
+function pediuNaoLigar(texto) { return RE_NAO_LIGAR.test(normalizar(texto)); }
+// Gente de verdade atendendo: "Alô?", "Oi", "Quem é?", "Pois não", "Boa tarde"
+const RE_ALO_HUMANO = /^(e |mas )?(alo|oi|ola|opa|pronto|pois nao|sim|fala|diga|pode falar|quem (e|fala|ta falando|esta falando)|bom dia|boa tarde|boa noite|e ai|oi quem)\b/;
+function ehAloHumano(texto) {
+  const n = normalizar(texto);
+  return !!n && n.split(" ").length <= 8 && RE_ALO_HUMANO.test(n);
+}
+// Espera em silêncio: sem "cortou aqui" e sem "você ainda está aí?" até o prazo
+function entrarEmEspera(st, motivo, ms = ESPERA_MAX_MS) {
+  const ate = Date.now() + ms;
+  const novo = !st.esperaAte;
+  if (ate > (st.esperaAte || 0)) st.esperaAte = ate;
+  st.ultimaPergunta = ""; st.jaRepetiuPergunta = true;
+  if (novo) L(st, `[espera] ⏳ ${motivo} — fico calado (até ${Math.round(ms / 1000)}s)`);
 }
 
 // ----- Nome -----
@@ -375,19 +455,47 @@ function limparSobra(t) {
   t = t.replace(/^[,\s]+/, "");
   return t ? t.charAt(0).toUpperCase() + t.slice(1) : t;
 }
+// Tira só o nome usado como chamamento ("Show, Ademar." / "Ademar, você…").
+// No meio da frase ("O Ademar está aí?") o nome fica — senão sobra "O está aí?".
+function tirarVocativos(texto, nome) {
+  const n = escaparRegex(nome);
+  return String(texto)
+    .replace(new RegExp(`\\s*,\\s*(?<!\\p{L})${n}(?!\\p{L})(?=\\s*([,.!?…]|$))`, "giu"), "")
+    .replace(new RegExp(`(^|[.!?…]\\s+)(?<!\\p{L})${n}(?!\\p{L})\\s*,\\s*`, "giu"), "$1");
+}
 function tirarNome(texto, nome) {
   if (!nome) return texto;
-  const n = escaparRegex(nome);
-  const t = String(texto)
-    .replace(new RegExp(`\\s*,\\s*(?<!\\p{L})${n}(?!\\p{L})`, "giu"), "")
-    .replace(new RegExp(`(?<!\\p{L})${n}(?!\\p{L})\\s*,\\s*`, "giu"), "")
-    .replace(new RegExp(`\\s*(?<!\\p{L})${n}(?!\\p{L})`, "giu"), "");
-  return limparSobra(t);
+  return limparSobra(tirarVocativos(texto, nome));
 }
 function manterSoPrimeira(texto, nome) {
-  let visto = false;
-  const t = String(texto).replace(reNome(nome), (m) => { if (!visto) { visto = true; return m; } return ""; });
-  return limparSobra(t);
+  const s = String(texto);
+  const m = new RegExp(`(?<!\\p{L})${escaparRegex(nome)}(?!\\p{L})`, "iu").exec(s);
+  if (!m) return s;
+  const corte = m.index + m[0].length;
+  return limparSobra(s.slice(0, corte) + tirarVocativos(s.slice(corte), nome));
+}
+// Erro de digitação do nome pelo Claude ("Adenar" no lugar de "Ademar")
+function quaseIgual(a, b) {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, dif = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++dif > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else { i++; j++; }
+  }
+  return dif + (a.length - i) + (b.length - j) <= 1;
+}
+function corrigirNome(texto, nome, protegidas) {
+  if (!nome || nome.length < 5) return texto;
+  const alvo = normalizar(nome);
+  return String(texto).replace(/\p{Lu}\p{L}{3,}/gu, (w) => {
+    const nw = normalizar(w);
+    if (nw === alvo || protegidas?.has(nw)) return w;
+    return quaseIgual(nw, alvo) ? nome : w;
+  });
 }
 
 // ----- Perguntas -----
@@ -562,6 +670,15 @@ A transcrição do telefone às vezes erra e chega uma palavra sem sentido
 
 FORMATO DA FALA (isto vira áudio):
 Números por extenso. Nada de listas, asteriscos ou emojis.
+O único marcador que existe é [FIM]. Nunca escreva outra coisa entre colchetes.
+
+SE PEDIREM PRA ESPERAR ("aguarde", "só um minutinho", "vou chamar ele"):
+responda só "Tudo bem, eu aguardo." e pare. Não explique nada.
+
+SE QUEM ATENDEU NÃO FOR A PESSOA (filho, esposa, secretária) ou disser que a conta
+é de outra pessoa: pergunte se dá pra falar com ela agora. Se não der, pergunte o
+melhor horário ou telefone pra falar com ela, agradeça e encerre. NÃO leia de volta
+números que a pessoa ditar — o sistema anota. Diga só "Anotado, obrigado!".
 
 ════════ REGRAS DE OURO (valem mais que tudo acima) ════════
 1. UMA pergunta por resposta. Fez a pergunta, PARE e espere a resposta.
@@ -662,9 +779,17 @@ async function enviarAudio(ws, st, audio, meuTurno) {
   return true;
 }
 
+// Marcadores entre colchetes nunca viram voz ("[AGUARDANDO]" foi falado no piloto)
+function semMarcadores(texto) {
+  return String(texto || "").replace(/\[[^\]]{1,30}\]/g, " ").replace(/\s{2,}/g, " ").trim();
+}
 async function falarComMinhaVoz(ws, st, texto, meuTurno) {
+  if (st.fechado || st.turno !== meuTurno) return false;   // ligação caiu ou turno velho: não gasta voz
+  texto = semMarcadores(texto);
+  if (!texto) return false;
   const cfg = { vozId: st.vozId, velocidade: st.velocidade, settings: st.vozSettings };
-  const audio = await sintetizar(texto, cfg, st);
+  // a saudação repetida (depois do assistente de chamadas) sai do cache, na hora
+  const audio = texto === st.saudacao ? await obterSaudacao(cfg, texto, st).promessa : await sintetizar(texto, cfg, st);
   if (!audio) return false;
   return enviarAudio(ws, st, audio, meuTurno);
 }
@@ -1020,7 +1145,10 @@ app.post("/twilio/status", async (req, res) => {
   const status = String(req.body?.CallStatus || "").toLowerCase();
   const duracao = parseInt(req.body?.CallDuration || "0", 10);
   if (!sid) return;
-  console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)`);
+  // detalhes que a Twilio manda em falha/ocupado (ajudam a entender "Falha na chamada")
+  const detalhes = ["SipResponseCode", "ErrorCode", "ErrorMessage", "AnsweredBy"]
+    .filter((k) => req.body?.[k]).map((k) => `${k}=${req.body[k]}`).join(" ");
+  console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)${detalhes ? " | " + detalhes : ""}`);
   if (status === "completed" && duracao > 0) {
     console.log(`[twilio-status] atendida (${duracao}s) — o motor cuida do registro`);
     return;
@@ -1272,6 +1400,14 @@ async function gravarLigacao({ supabase, callSid, campanhaId, contatoId, transcr
   const fatos = [];
   if (zapOk) fatos.push(`O sistema anotou o WhatsApp ${zapOk} e a pessoa CONFIRMOU. Use exatamente este número no "resultado".`);
   if (zapDuvida) fatos.push(`O sistema entendeu o WhatsApp ${zapDuvida}, mas a pessoa NÃO confirmou. Cite-o como "não confirmado".`);
+  // Números ditos por extenso ("três meia cinco dois…"): o motor converte, o resumo não chuta
+  for (const linha of String(transcricao || "").split("\n")) {
+    if (!linha.startsWith("Cliente:")) continue;
+    const dig = palavrasParaDigitos(linha.slice(8));
+    if (dig.length >= 8 && !fatos.some((f) => f.includes(dig))) {
+      fatos.push(`A pessoa ditou os dígitos ${dig} (convertidos pelo sistema; "meia" = 6). Se citar esse número, use exatamente esses dígitos.`);
+    }
+  }
 
   let resultado = null, sentimento = null, nota = null;
   if (anthropic && houveConversa && transcricao.trim()) {
@@ -1295,6 +1431,7 @@ Transcrição:\n\n${transcricao}` }],
   if (zapOk && !String(resultado || "").includes(zapOk)) resultado = juntarTexto(resultado, `WhatsApp confirmado: ${zapOk}.`);
   if (zapDuvida && !String(resultado || "").includes(zapDuvida)) resultado = juntarTexto(resultado, `WhatsApp NÃO confirmado: ${zapDuvida}.`);
   if (!houveConversa && extras.motivoSemConversa && !resultado) resultado = extras.motivoSemConversa;
+  if (extras.naoLigarMais) resultado = juntarTexto(resultado, "PEDIU PARA NÃO LIGAR MAIS (contato marcado como Não atender).");
   if (resultado || sentimento || nota !== null) L(st, `[relatorio] resumo: ${sentimento} | nota ${nota} | ${resultado}`);
 
   try {
@@ -1304,6 +1441,10 @@ Transcrição:\n\n${transcricao}` }],
       finalizada_em: new Date().toISOString(),
     }).eq("twilio_call_sid", callSid);
 
+    if (contatoId && extras.naoLigarMais) {
+      await supabase.from("contatos").update({ status: "nao_atender" }).eq("id", contatoId);
+      L(st, "[contato] 🚫 marcado como \"Não atender\" — nenhuma campanha liga de novo");
+    }
     if (campanhaId && contatoId) {
       if (houveConversa) {
         await supabase.from("campanha_contatos").update({
@@ -1346,7 +1487,17 @@ function aquecerCerebro(st) {
 
 // ----- Turnos -----
 // Todo turno do Carlos (resposta do Claude, frase do sistema, resgate) começa aqui.
+// Fala do Carlos cortada no meio (pessoa interrompeu): entra no histórico e na transcrição,
+// senão o Claude não sabe o que já disse e a transcrição parece que ele ficou mudo.
+function registrarParcial(st) {
+  const p = st.parcial;
+  st.parcial = null;
+  if (!p || !p.texto) return;
+  st.historico.push({ role: "assistant", content: `${p.texto} —` });
+  st.transcricao.push(`Agente: ${p.texto} (interrompido)`);
+}
 function iniciarTurno(st) {
+  registrarParcial(st);
   st.turno++;
   st.falando = true; st.marcasPendentes = 0;
   st.turnoPronto = false; st.turnoEmPergunta = false;
@@ -1449,6 +1600,8 @@ function aplicarTravas(st, trecho) {
 
   // Nome: natural, no máximo N por resposta (e opcionalmente N por ligação)
   if (st.nomeCliente) {
+    const corrigido = corrigirNome(t, st.nomeCliente, st.palavrasProtegidas);
+    if (corrigido !== t) { L(st, `[roteiro] 👤 nome corrigido: "${t}" → "${corrigido}"`); t = corrigido; }
     const n = contarNome(t, st.nomeCliente);
     if (n > 0) {
       const estourouTurno = st.nomeNoTurno >= MAX_NOME_POR_TURNO;
@@ -1527,6 +1680,7 @@ async function pensarEResponder(ws, st, falaDoCliente) {
   st.tentativasResgate = 0;
   st.nomeNoTurno = 0;
   st.ultimaPergunta = ""; st.jaRepetiuPergunta = false;
+  st.parcial = { turno: meuTurno, texto: "" };
 
   const inicio = Date.now();
   let primeiraEm = 0, buffer = "", pendente = "";
@@ -1536,8 +1690,9 @@ async function pensarEResponder(ws, st, falaDoCliente) {
   const falado = [];
 
   const limparMarca = (t) => {
-    if (/\[FIM\]/i.test(t)) { pediuFim = true; return t.replace(/\[FIM\]/gi, "").trim(); }
-    return t;
+    if (/\[FIM\]/i.test(t)) pediuFim = true;
+    if (/\[(AGUARD|ESPER)[^\]]*\]/i.test(t)) entrarEmEspera(st, "o Claude marcou espera");
+    return semMarcadores(t);
   };
   const empurrar = (t) => {
     if (cortou) return;
@@ -1590,6 +1745,7 @@ async function pensarEResponder(ws, st, falaDoCliente) {
             L(st, `[cerebro] ⚡ primeira fala em ${primeiraEm}ms: "${trecho}"`);
           } else L(st, `[cerebro] continua: "${trecho}"`);
           falado.push(trecho);
+          if (st.parcial?.turno === meuTurno) st.parcial.texto = juntarTexto(st.parcial.texto, trecho);
           st.falaAtual = juntarTexto(st.falaAtual, trecho);
           const pergunta = ehPergunta(trecho);
           const social = pergunta && ehPerguntaSocial(item.frase || trecho, st.nomeCliente);
@@ -1633,6 +1789,7 @@ async function pensarEResponder(ws, st, falaDoCliente) {
     if (st.turno === meuTurno && dito) {
       st.historico.push({ role: "assistant", content: dito });
       st.transcricao.push(`Agente: ${dito}`);
+      if (st.parcial?.turno === meuTurno) st.parcial = null;
       L(st, `[cerebro] turno completo em ${Date.now() - inicio}ms`);
     }
 
@@ -1692,7 +1849,11 @@ wssStreams.on("connection", (ws) => {
     nomeCliente: "", usosNome: 0, nomeNoTurno: 0,
     modoDitado: false, ditadoAte: 0, pedidosNumero: 0,
     numeroEntendido: "", confirmandoNumero: false, whatsappConfirmado: "",
-    caixaPostal: false,
+    caixaPostal: false, motivoSemConversa: "", naoLigarMais: false,
+    // FASE 12.2: abertura, espera, assistente de chamadas, falas interrompidas
+    aguardandoAlo: false, primeiraVozEm: 0, ultimaAtividadeEm: 0, ouviuAlo: "",
+    esperaAte: 0, triagem: false, triagemFeita: false,
+    parcial: null, palavrasProtegidas: null, algumaVoz: false,
     fimDaFala: null,
   };
   L(st, "[streams] túnel aberto, aguardando áudio…");
@@ -1762,6 +1923,18 @@ wssStreams.on("connection", (ws) => {
     consumirAudio();
     st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
     if (!texto || st.encerrando || st.despedindo) return;
+    // Abertura: o "alô" da pessoa não vai pro Claude — quem responde é a saudação
+    if (st.aguardandoAlo) {
+      st.ouviuAlo = juntarTexto(st.ouviuAlo, texto);
+      L(st, `[abertura] 👋 ouvi: "${texto}"`);
+      return;
+    }
+    // Assistente de chamadas: só uma pessoa de verdade ("Alô?", "Oi", "Quem é?") tira da espera
+    if (st.triagem) {
+      if (ehAloHumano(texto)) sairDaTriagem(texto);
+      else L(st, `[triagem] (ignorado, assistente ainda na linha) "${texto}"`);
+      return;
+    }
     if (st.falando || st.claudePensando || st.marcasPendentes > 0) {
       if (podeGuardar(texto)) {
         st.respostaNaFila = juntarTexto(st.respostaNaFila, texto);
@@ -1783,6 +1956,10 @@ wssStreams.on("connection", (ws) => {
     st.jaDespachado = texto;
     st.despachadoEm = Date.now();
     L(st, `[ouvido] >>> pessoa disse: "${texto}"  [${motivo}]`);
+    if (!st.naoLigarMais && pediuNaoLigar(texto)) {
+      st.naoLigarMais = true;
+      L(st, "[contato] 🚫 pediu pra não ligar mais — vai ficar como \"Não atender\" no painel");
+    }
     if (tratarNumero(ws, st, texto, eraDitado)) return;
     pensarEResponder(ws, st, texto).catch((e) => LE(st, `[cerebro] erro inesperado: ${e?.message || e}`));
   }
@@ -1821,25 +1998,79 @@ wssStreams.on("connection", (ws) => {
     }, ms);
   }
 
-  // Caiu na caixa postal (ou recado da operadora): cala, desliga e NÃO conta como conversa.
-  // O contato volta pra fila e é chamado de novo mais tarde (até o máximo de tentativas).
-  function pegouCaixaPostal(texto) {
+  // Máquina no lugar da pessoa (piloto 28/09): caixa postal, recado da operadora, assistente
+  // de chamadas. Caixa/recado/"indisponível": cala, desliga e NÃO conta como conversa — o
+  // contato volta pra fila. Assistente pedindo nome e motivo: o Carlos se apresenta e espera.
+  // Devolve true quando o texto era da máquina (não segue pro Claude).
+  function pegouMaquina(texto) {
     if (st.caixaPostal) return true;
     if (!CAIXA_POSTAL || st.encerrando || st.fechado) return false;
-    if (Date.now() - st.iniciadoEm > CAIXA_POSTAL_JANELA_S * 1000) return false;
-    if (!ehCaixaPostal(texto) && !ehCaixaPostal(juntarTexto(st.balde, texto))) return false;
+    if (CAIXA_POSTAL_JANELA_S > 0 && Date.now() - st.iniciadoEm > CAIXA_POSTAL_JANELA_S * 1000) return false;
+    let tipo = tipoDeMaquina(texto);
+    if (!tipo && st.balde) tipo = tipoDeMaquina(juntarTexto(st.balde, texto));
+    if (!tipo) {
+      if (st.esperaAte && !st.triagem && ehAloHumano(texto)) {
+        st.esperaAte = 0;
+        L(st, `[espera] a pessoa voltou: "${texto}"`);
+      }
+      return false;
+    }
+    if (tipo === "espera") {
+      if (st.triagem) { entrarEmEspera(st, `assistente: "${texto}"`, TRIAGEM_MAX_MS); return true; }
+      entrarEmEspera(st, `pediram pra aguardar: "${texto}"`);
+      return false;   // gente de verdade: o Claude responde "Tudo bem, eu aguardo."
+    }
+    if (tipo === "triagem") {
+      if (st.triagemFeita) return true;                                     // o assistente repetindo
+      if (st.historico.some((m) => m.role === "user")) return false;         // já era conversa de verdade
+      entrarNaTriagem(texto);
+      return true;
+    }
     st.caixaPostal = true;
-    L(st, `[caixa-postal] 📭 "${texto}" — desligando (conta como não atendeu)`);
-    calarABoca(ws, st, "caixa postal");
+    st.motivoSemConversa = MOTIVO_MAQUINA[tipo] || "Caixa postal";
+    L(st, `[maquina] 📭 ${st.motivoSemConversa}: "${texto}" — desligando (conta como não atendeu)`);
+    st.aguardandoAlo = false;
+    calarABoca(ws, st, st.motivoSemConversa);
     limparFlush(); st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
-    st.transcricao.push("(caixa postal — desligado pelo motor)");
-    desligar(st, "caixa postal").catch(() => {});
+    st.transcricao.push(`(${st.motivoSemConversa} — desligado pelo motor: "${texto}")`);
+    desligar(st, st.motivoSemConversa).catch(() => {});
     return true;
   }
 
+  // "Aqui é o Carlos, da Invite Energy." (tirado da saudação) + motivo
+  function fraseDeTriagem() {
+    const m = String(st.saudacao || "").match(/aqui (é|e) [^.!?]+/i);
+    const quem = m ? m[0].trim().replace(/^./, (c) => c.toUpperCase()) + "." : "";
+    return juntarTexto(quem, FRASE_MOTIVO_TRIAGEM);
+  }
+  function entrarNaTriagem(texto) {
+    st.triagem = true; st.triagemFeita = true; st.aguardandoAlo = false;
+    L(st, `[triagem] 🤖 assistente de chamadas: "${texto}" — me apresento e espero calado`);
+    calarABoca(ws, st, "assistente de chamadas");
+    limparFlush(); st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
+    st.transcricao.push(`Assistente do celular: ${texto}`);
+    entrarEmEspera(st, "assistente de chamadas", TRIAGEM_MAX_MS);
+    falarAvulso(ws, st, fraseDeTriagem(), "triagem")
+      .then(() => { st.ultimaPergunta = ""; st.jaRepetiuPergunta = true; })
+      .catch((e) => LE(st, `[triagem] erro: ${e?.message || e}`));
+  }
+  function sairDaTriagem(texto) {
+    st.triagem = false; st.esperaAte = 0;
+    L(st, `[triagem] 🙋 a pessoa atendeu: "${texto}" — repito a saudação`);
+    if (st.falando || st.marcasPendentes > 0) calarABoca(ws, st, "a pessoa atendeu");
+    st.transcricao.push(`Cliente: ${texto}`);
+    falarAvulso(ws, st, st.saudacao, "saudacao")
+      .then((meu) => {
+        if (st.turno === meu) { st.ultimaPergunta = ultimaFrasePergunta(st.saudacao); st.jaRepetiuPergunta = false; }
+      })
+      .catch((e) => LE(st, `[triagem] erro: ${e?.message || e}`));
+  }
+
   function aoDetectarVoz() {
-    if (st.falando || st.claudePensando || st.marcasPendentes > 0) return;
     const agora = Date.now();
+    st.ultimaAtividadeEm = agora; st.algumaVoz = true;
+    if (!st.primeiraVozEm) st.primeiraVozEm = agora;
+    if (st.falando || st.claudePensando || st.marcasPendentes > 0) return;
     st.vozEm = agora;
     if (agora - st.vozLogEm > 3000) { st.vozLogEm = agora; L(st, "[ouvido] 🗣️ voz detectada"); }
   }
@@ -1890,7 +2121,9 @@ wssStreams.on("connection", (ws) => {
       if (ev.type !== "Results") return;
       const { texto, fim, semTempo } = textoNovo(ev.channel?.alternatives?.[0]);
       if (!texto) return;
-      if (pegouCaixaPostal(texto)) return;
+      st.ultimaAtividadeEm = Date.now(); st.algumaVoz = true;
+      if (!st.primeiraVozEm) st.primeiraVozEm = st.ultimaAtividadeEm;
+      if (pegouMaquina(texto)) return;
       // sem os tempos das palavras, volta pro filtro antigo (mesmo texto em 5s)
       if (semTempo && texto === st.jaDespachado && Date.now() - st.despachadoEm < ECO_MS) return;
 
@@ -1898,7 +2131,8 @@ wssStreams.on("connection", (ws) => {
       st.tentativasResgate = 0;
       const estaFalando = st.falando || st.marcasPendentes > 0 || st.claudePensando;
 
-      if (estaFalando && texto.length >= BARGE_MIN_CHARS && !st.encerrando && !st.despedindo) {
+      const triagemMaquina = st.triagem && !ehAloHumano(texto);   // assistente falando: não interrompe o Carlos
+      if (estaFalando && texto.length >= BARGE_MIN_CHARS && !st.encerrando && !st.despedindo && !triagemMaquina) {
         if (ehEcoProvavel(st, texto)) {
           L(st, `[barge-in] (eco da minha própria voz, ignorado) "${texto}"`);
         } else if (Date.now() > st.podeInterromperApos) {
@@ -1974,6 +2208,34 @@ wssStreams.on("connection", (ws) => {
     });
   }
 
+  // Abertura humana: quem atende costuma dizer "Alô?" — o Carlos responde depois disso, em
+  // vez de atropelar. Ninguém falou em ALO_SILENCIO_MS → começa assim mesmo. Se a "pessoa"
+  // for máquina (caixa postal, recado, assistente), ela se revela aqui, antes do Carlos falar.
+  async function esperarAlo() {
+    if (!ESPERAR_ALO) return true;
+    const livre = () => !st.fechado && !st.encerrando && !st.triagem && !st.caixaPostal;
+    st.aguardandoAlo = true;
+    const t0 = Date.now();
+    let motivo = "limite de espera";
+    while (st.aguardandoAlo && livre()) {
+      const agora = Date.now();
+      if (agora - t0 >= ALO_MAX_MS) break;
+      if (!st.primeiraVozEm && agora - t0 >= ALO_SILENCIO_MS) { motivo = "ninguém falou"; break; }
+      if (st.primeiraVozEm && agora - st.ultimaAtividadeEm >= ALO_PAUSA_MS) { motivo = "a pessoa falou"; break; }
+      await pausa(40);
+    }
+    const segue = st.aguardandoAlo && livre();
+    st.aguardandoAlo = false;
+    if (!segue) return false;
+    const ouvido = juntarTexto(st.ouviuAlo, falaAcumulada());
+    // o "alô" já foi respondido pela saudação: nada dele sobra pro Claude
+    limparFlush(); consumirAudio();
+    st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
+    L(st, `[abertura] ${ouvido ? `👋 ouvi "${ouvido}"` : motivo === "ninguém falou" ? "🤫 ninguém falou" : `🗣️ ${motivo}`}` +
+      ` — saudação depois de ${Date.now() - t0}ms`);
+    return true;
+  }
+
   async function iniciarConversa() {
     const t0 = Date.now();
     const sb = await getSupabaseLogado();
@@ -2026,6 +2288,17 @@ wssStreams.on("connection", (ws) => {
     abrirOuvido();
     aquecerCerebro(st);
 
+    // Palavras da saudação e do agente (menos o nome do cliente) nunca viram "nome corrigido"
+    const nomeNorm = normalizar(st.nomeCliente);
+    st.palavrasProtegidas = new Set(normalizar(`${st.saudacao} ${st.agente?.nome || ""}`)
+      .split(" ").filter((w) => w && w !== nomeNorm));
+
+    const tS = Date.now();
+    const { promessa, doCache } = obterSaudacao(cfg, st.saudacao, st);   // já vai buscando o áudio
+
+    // Espera o "alô" (ou a máquina se revelar) antes de falar
+    if (!(await esperarAlo())) return;
+
     const meuTurno = iniciarTurno(st);
     st.podeInterromperApos = Date.now() + 1500;
     st.calado_desde = Date.now();
@@ -2034,8 +2307,6 @@ wssStreams.on("connection", (ws) => {
     st.turnoEmPergunta = ehPergunta(st.saudacao);
     if (st.nomeCliente && contarNome(st.saudacao, st.nomeCliente) > 0) st.usosNome++;
 
-    const tS = Date.now();
-    const { promessa, doCache } = obterSaudacao(cfg, st.saudacao, st);
     const audio = await promessa;
     L(st, `[saudacao] ${doCache ? "🎯 veio do cache" : "gerada agora"} — pronta em ${Date.now() - tS}ms` +
       (audio ? ` (${(audio.length / 8000).toFixed(1)}s)` : ""));
@@ -2048,22 +2319,44 @@ wssStreams.on("connection", (ws) => {
   }
 
   const vigia = setInterval(async () => {
-    if (st.fechado || st.encerrando || st.despedindo || !st.persona || st.vigiaOcupado) return;
+    if (st.fechado || st.encerrando || st.despedindo || !st.persona || st.vigiaOcupado || st.aguardandoAlo) return;
     const ditado = emDitado();
     const ocupado = st.falando || st.claudePensando || st.marcasPendentes > 0;
     if (ocupado || st.balde || st.ultimoInterim) { st.calado_desde = Date.now(); return; }
     const agora = Date.now();
 
+    // 0) Em espera ("permaneça na linha", "aguarde", assistente de chamadas): calado até o prazo
+    if (st.esperaAte) {
+      if (agora < st.esperaAte) { st.calado_desde = agora; return; }
+      st.esperaAte = 0;
+      if (st.triagem) {
+        st.motivoSemConversa = "Assistente de chamadas: ninguém atendeu";
+        L(st, "[triagem] ⌛ o assistente não passou a ligação — desligando (tenta de novo depois)");
+        st.vigiaOcupado = true;
+        try { await desligar(st, "assistente de chamadas sem retorno"); } finally { st.vigiaOcupado = false; }
+        return;
+      }
+      L(st, "[espera] ⌛ acabou o tempo de espera");
+      st.calado_desde = agora - st.silencioMs;   // chama "Alô, você ainda está aí?" já
+    }
+
     // 1) Fez uma pergunta e a resposta não chegou: pergunta de novo, rápido
     if (REPERGUNTAR && !ditado && st.ultimaPergunta && !st.jaRepetiuPergunta && st.esperandoDesde) {
       const ouviuVoz = st.vozEm > st.esperandoDesde;
       const esperou = agora - st.esperandoDesde;
-      const limite = Math.min(REPERGUNTA_MS, st.silencioMs);
-      if ((ouviuVoz && agora - st.vozEm >= REPERGUNTA_VOZ_MS) || esperou >= limite) {
+      // Depois da saudação a pessoa demora mais (ainda está entendendo quem ligou):
+      // espera um pouco mais e não usa o atalho de 3s da "voz sem texto" (piloto: Alex)
+      const naSaudacao = !st.historico.some((m) => m.role === "user");
+      const limite = Math.min(naSaudacao ? REPERGUNTA_SAUDACAO_MS : REPERGUNTA_MS, st.silencioMs);
+      const atalhoVoz = !naSaudacao && ouviuVoz && agora - st.vozEm >= REPERGUNTA_VOZ_MS;
+      if (atalhoVoz || esperou >= limite) {
         st.jaRepetiuPergunta = true;
-        L(st, `[vigia] ${ouviuVoz ? "ouvi voz, mas não chegou texto" : `${(esperou / 1000).toFixed(1)}s sem resposta`} — repetindo a pergunta`);
+        // Nunca ouviu voz nenhuma na ligação: um "Alô?" curto em vez de repetir a saudação inteira
+        const frase = !st.algumaVoz ? FRASE_ALO : `${FRASE_REPERGUNTA} ${st.ultimaPergunta}`;
+        L(st, `[vigia] ${ouviuVoz ? "ouvi voz, mas não chegou texto" : `${(esperou / 1000).toFixed(1)}s sem resposta`} — ` +
+          (!st.algumaVoz ? "ninguém falou até agora: \"Alô?\"" : "repetindo a pergunta"));
         st.vigiaOcupado = true;
-        try { await falarAvulso(ws, st, `${FRASE_REPERGUNTA} ${st.ultimaPergunta}`, "repergunta"); }
+        try { await falarAvulso(ws, st, frase, "repergunta"); }
         finally { st.vigiaOcupado = false; }
       }
       return;
@@ -2071,6 +2364,16 @@ wssStreams.on("connection", (ws) => {
 
     // 2) Silêncio longo: resgate → resgate → despedida
     const mudoHa = agora - st.calado_desde;
+    // Ninguém falou NADA na ligação (recado da operadora gravando, ou atendeu e largou):
+    // depois do "Alô?" desliga logo e tenta de novo mais tarde
+    if (!st.algumaVoz && st.jaRepetiuPergunta) {
+      if (mudoHa < Math.min(SILENCIO_SEM_VOZ_MS, st.silencioMs)) return;
+      st.motivoSemConversa = "Atendeu e ficou em silêncio";
+      L(st, "[vigia] 🔇 ninguém falou nada na ligação — desligando (tenta de novo depois)");
+      st.vigiaOcupado = true;
+      try { await desligar(st, "silêncio total"); } finally { st.vigiaOcupado = false; }
+      return;
+    }
     if (mudoHa < st.silencioMs) return;
     const RESGATES = ["Alô, você ainda está aí?", "Se preferir, eu ligo em outro momento. Pode ser?"];
     st.vigiaOcupado = true;
@@ -2130,12 +2433,15 @@ wssStreams.on("connection", (ws) => {
 
     if (msg.event === "stop") {
       L(st, `[streams] fim do túnel — pacotes: ${st.pacotes}`);
+      st.encerrando = true;   // a ligação acabou: nada de re-pergunta nem fala nova
       return;
     }
   });
 
   ws.on("close", async () => {
-    st.fechado = true;
+    st.fechado = true; st.encerrando = true; st.aguardandoAlo = false;
+    st.turno++;                      // invalida o turno em andamento (para de pensar e de falar)
+    registrarParcial(st);
     clearInterval(vigia); limparFlush();
     const duracao = Math.round((Date.now() - st.iniciadoEm) / 1000);
     const zap = st.whatsappConfirmado
@@ -2148,16 +2454,21 @@ wssStreams.on("connection", (ws) => {
     if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
     if (st.dg) { try { st.dg.close(); } catch {} }
 
+    const conversou = !st.caixaPostal && st.historico.some((m) => m.role === "user");
+    const motivoSemConversa = conversou ? "" : (st.motivoSemConversa ||
+      (st.triagem ? "Assistente de chamadas: não passou a ligação"
+        : st.algumaVoz ? "Atendeu e desligou sem responder" : "Atendeu e ficou em silêncio"));
     await gravarLigacao({
       supabase: st.campanhaId ? st.supabase : null,
       callSid: st.callSid, campanhaId: st.campanhaId, contatoId: st.contatoId,
       transcricao: st.transcricao.join("\n"),
-      houveConversa: !st.caixaPostal && st.historico.some((m) => m.role === "user"),
+      houveConversa: conversou,
       duracao,
       extras: {
         whatsappConfirmado: st.whatsappConfirmado,
         whatsappNaoConfirmado: st.whatsappConfirmado ? "" : st.numeroEntendido,
-        motivoSemConversa: st.caixaPostal ? "Caixa postal" : "",
+        motivoSemConversa,
+        naoLigarMais: st.naoLigarMais,
       },
       st,
     });
