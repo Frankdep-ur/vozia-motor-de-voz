@@ -1,6 +1,23 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.5 — CUSTO DA TWILIO (29/09, V1 + V2: 198 ligações)
+ *   80% do gasto da Twilio foi com máquina (caixa postal / recado de operadora): a
+ *     Twilio cobra o MINUTO CHEIO mesmo quando a ligação dura 15s
+ *   Corte do toque: a caixa postal das operadoras atende com ~36s de toque e quem
+ *     conversou com o Carlos atendeu em até 29s. Tocou 33s (TEMPO_MAX_TOQUE_S) e
+ *     ninguém atendeu → o motor cancela ANTES da caixa postal. Ligação não atendida
+ *     a Twilio não cobra (~30% menos custo). Conta como "Não atendeu" → 2ª tentativa
+ *   Log mostra com quantos segundos de toque cada ligação foi atendida
+ *   Recado gravado pelo próprio cliente ("devo estar com o celular desligado, não
+ *     consigo atender… te retorno assim que puder") agora é caixa postal: o Carlos
+ *     não conversa com a gravação e o contato ganha a 2ª tentativa
+ *   Pessoa que só disse "Alô?" / "Oi?" / "Quem é?" (não ouviu o Carlos ou desligou
+ *     na saudação) não conta mais como conversa → o contato volta pra fila
+ *   Assistente de IA do celular ("Sou um assistente de IA gravando esta chamada… diga
+ *     quem você é e informe o motivo") é reconhecido como assistente de chamadas: o
+ *     Carlos se apresenta e espera; "a pessoa está ocupada agora" → desliga e religa
+ * ---------------------------------------------------------------------------
  * FASE 12.4 — LIÇÕES DA LISTA 100.V1 (28/09, 86 ligações)
  *   "Permaneça na linha" / "só um minutinho": o Carlos responde "Tudo bem, eu aguardo."
  *     e NUNCA desliga nessa hora (na V1 o Claude marcou [FIM] e ele desligou no Márcio).
@@ -110,6 +127,9 @@ const PAUSA_ENTRE_LIGACOES_MS = parseInt(process.env.PAUSA_ENTRE_LIGACOES_MS || 
 // "não atendeu" (volta pra fila). JANELA 0 = vale a ligação inteira.
 const CAIXA_POSTAL = process.env.CAIXA_POSTAL !== "0";
 const CAIXA_POSTAL_JANELA_S = parseFloat(process.env.CAIXA_POSTAL_JANELA_S || "0");
+// FASE 12.5: tocou esse tempo e ninguém atendeu → cancela antes da caixa postal da operadora
+// (ela atende com ~36s; na V1/V2 ninguém conversou depois de 29s). 0 = não corta.
+const TEMPO_MAX_TOQUE_S = parseFloat(process.env.TEMPO_MAX_TOQUE_S || "33");
 
 // Abertura: espera o "alô" da pessoa antes da saudação
 const ESPERAR_ALO = process.env.ESPERAR_ALO !== "0";
@@ -273,12 +293,14 @@ function avisarFaltando() {
   console.log(
     `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez no total (todas as campanhas) | horário ${descricaoHorario()} (Brasília) ` +
     `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.4`
+    `| corte do toque: ${TEMPO_MAX_TOQUE_S > 0 ? `${TEMPO_MAX_TOQUE_S}s (antes da caixa postal, não é cobrada)` : "off"} ` +
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.5`
   );
   console.log(
     `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms, voz sem texto ${ALO_VOZ_SEM_TEXTO_MS}ms)` : "fala na hora"} ` +
     `| assistente de chamadas: diz o nome da pessoa, se apresenta e espera no máx ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
-    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s (só quando pedem), ninguém voltou → 1 "alô" e desliga em ${Math.round(ESPERA_ALO_MS / 1000)}s | FASE 12.4`
+    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s (só quando pedem), ninguém voltou → 1 "alô" e desliga em ${Math.round(ESPERA_ALO_MS / 1000)}s ` +
+    `| só "alô" / recado gravado pelo cliente: não conta como conversa (volta pra fila) | FASE 12.5`
   );
 }
 
@@ -428,13 +450,25 @@ const RE_CAIXA_POSTAL = new RegExp([
   "\\bfora da area de cobertura\\b", "\\bdesligado ou fora\\b",
   "\\bprogramado para nao receber\\b",
   "\\bnumero (que voce ligou|chamado|discado) (nao existe|esta desligado|nao esta disponivel)\\b",
+  // FASE 12.5: recado gravado pelo próprio cliente (V2: "Opa, beleza. Eu devo estar com
+  // celular desligado agora, eu não consigo atender… te retorno") — quem atende de verdade
+  // não está com o celular desligado
+  "\\b(devo estar|devo ta|devo tar|estou|to|tou) com (o )?(celular|telefone) desligado\\b",
+  "\\bno momento nao (posso|consigo|estou podendo) atender\\b",
+  "\\bnao (posso|consigo) atender\\b.*\\b(te retorno|retorno (a sua|sua)|retornarei|ligo de volta)\\b",
+  "\\b(te|lhe) retorno assim que (possivel|puder|der)\\b", "\\bretornarei (a sua |sua )?(ligacao|chamada)\\b",
 ].join("|"));
 // Serviço de recado da operadora: "Vamos entregar o seu recado assim que o celular estiver disponível"
 const RE_RECADO = /\b(vamos entregar o seu|entrego o seu recado|entregar o seu recado|assim que o (celular|telefone|aparelho) estiver|quando o (celular|telefone|aparelho) estiver disponivel)\b/;
 // Assistente de chamadas do celular: fim da triagem sem a pessoa
-const RE_INDISPONIVEL = /\b(esta pessoa nao esta disponivel|deixe outra mensagem)\b/;
+// FASE 12.5: + assistente de IA ("A pessoa para quem você está ligando está ocupada agora.")
+const RE_INDISPONIVEL = /\b(esta pessoa nao esta disponivel|deixe outra mensagem|(pessoa|contato) (para|pra) quem (voce|vc) esta ligando (esta|ta) (ocupada|ocupado|indisponivel))\b/;
 // Assistente de chamadas pedindo nome e motivo
-const RE_TRIAGEM = /\b(seu nome e o motivo|poderei ver se (esta|essa) pessoa|servico de triagem|triagem de chamadas|esta usando (o |um )?(bixby|assistente))\b/;
+// FASE 12.5 (V2, 29/09): "Sou um assistente de IA gravando esta chamada para a pessoa que você
+// está tentando contatar. Diga quem você é e informe o motivo da sua chamada."
+const RE_TRIAGEM = /\b(seu nome e o motivo|poderei ver se (esta|essa) pessoa|servico de triagem|triagem de chamadas|esta usando (o |um )?(bixby|assistente)|assistente (de ia|de inteligencia artificial|virtual) (gravando|atendendo)|gravando (esta|essa) (chamada|ligacao) para a pessoa|diga quem (voce|vc) e e (informe|diga|fale) o motivo|informe o motivo da sua (chamada|ligacao))\b/;
+// FASE 12.5: com o assistente já na linha, estas falas são dele (não da pessoa atendendo)
+const RE_FALA_DO_ASSISTENTE = /\b(diga quem (voce|vc) e|informe o motivo|gravando (esta|essa) (chamada|ligacao)|assistente)\b/;
 // Pedido pra esperar (assistente ou gente de verdade chamando alguém)
 const RE_ESPERA = /\b(permaneca na linha|aguarde (na linha|um (momento|instante|minuto|minutinho|pouquinho))|aguarda (um|so) (pouco|pouquinho|minutinho|instante|momento)|so um (minutinho|momento|instante|segundinho)|um momentinho|vou chamar (ele|ela|o|a))\b/;
 
@@ -462,6 +496,15 @@ const RE_ALO_HUMANO = /^(e |mas )?(alo|oi|ola|opa|pronto|pois nao|sim|fala|diga|
 function ehAloHumano(texto) {
   const n = normalizar(texto);
   return !!n && n.split(" ").length <= 8 && RE_ALO_HUMANO.test(n);
+}
+// FASE 12.5: fala que é SÓ "Alô?" / "Oi?" / "Quem é?" / "Quem fala?" (nada de resposta).
+// Se a pessoa só disse isso na ligação inteira, ela não ouviu o Carlos ou desligou na
+// saudação (V1: Jair disse "Alô?" duas vezes) — não é conversa, o contato volta pra fila
+const PALAVRA_ALO = "(alo|oi|ola|hein|ahn|pronto|quem|quem e|quem fala|quem ta falando|quem esta falando)";
+const RE_SO_ALO = new RegExp(`^${PALAVRA_ALO}( ${PALAVRA_ALO})*$`);
+function soDisseAlo(texto) {
+  const n = normalizar(texto);
+  return !!n && RE_SO_ALO.test(n);
 }
 // A última fala da pessoa foi um pedido pra esperar ("permaneça na linha", "só um minutinho")
 function pediramPraEsperar(st) {
@@ -890,6 +933,69 @@ async function resolverNaoAtendida(supabase, lig, motivo) {
 }
 
 // ============================================================================
+// FASE 12.5 — CORTE DO TOQUE (não paga caixa postal)
+// ============================================================================
+// A caixa postal das operadoras atende com ~36s de toque (V1/V2: 40 ligações exatamente
+// aí) e a Twilio cobra o minuto cheio. Quem conversou com o Carlos atendeu em até 29s.
+// Tocou TEMPO_MAX_TOQUE_S e ninguém atendeu → o motor cancela a ligação. O "canceled" da
+// Twilio só derruba ligação que ainda está tocando: se atendeu no último segundo, ela
+// ignora e a conversa segue. Ligação não atendida a Twilio não cobra.
+const MOTIVO_CORTE_TOQUE = `Não atendeu (tocou ${TEMPO_MAX_TOQUE_S}s — cancelada antes da caixa postal)`;
+const toqueVigiado = new Map();      // CallSid → timer do corte (sai quando atende ou termina)
+const discadaEm = new Map();         // CallSid → quando discou (pra medir o toque)
+const cortadasNoToque = new Set();   // CallSid que o motor cancelou por tocar demais
+
+function vigiarToque(sid) {
+  if (!sid) return;
+  discadaEm.set(sid, Date.now());
+  if (!(TEMPO_MAX_TOQUE_S > 0) || !twilioClient) return;
+  const timer = setTimeout(async () => {
+    if (toqueVigiado.get(sid) !== timer) return;          // já atendeu ou já terminou
+    toqueVigiado.delete(sid);
+    const tag = sid.slice(-4);
+    cortadasNoToque.add(sid);        // antes de pedir: o aviso "canceled" da Twilio pode chegar antes da resposta
+    try {
+      const r = await twilioClient.calls(sid).update({ status: "canceled" });
+      const situacao = String(r?.status || "canceled");
+      if (!["canceled", "queued", "ringing", "initiated"].includes(situacao)) {   // atendeu no último segundo
+        cortadasNoToque.delete(sid);
+        return;
+      }
+      discadaEm.delete(sid);
+      console.log(`[toque] ⏱️ [${tag}] tocou ${TEMPO_MAX_TOQUE_S}s e ninguém atendeu — cancelei antes da caixa postal (não é cobrada)`);
+      // rede de segurança: se a Twilio não mandar o aviso de "canceled", resolvo aqui
+      setTimeout(() => resolverCortada(sid).catch(() => {}), MARGEM_CALLBACK_MS + 8000);
+    } catch (e) {
+      cortadasNoToque.delete(sid);
+      console.log(`[toque] [${tag}] não cancelei (${e?.message || e}) — segue normal`);
+    }
+  }, TEMPO_MAX_TOQUE_S * 1000);
+  toqueVigiado.set(sid, timer);
+}
+// Atendeu (a Twilio pediu o TwiML / abriu o áudio) ou a ligação terminou: para de vigiar
+function pararDeVigiarToque(sid) {
+  if (!sid) return;
+  const t = toqueVigiado.get(sid);
+  if (t) { clearTimeout(t); toqueVigiado.delete(sid); }
+}
+// Segundos de toque até atender (null se não sabe); mede uma vez só
+function segundosDeToque(sid) {
+  const t = sid ? discadaEm.get(sid) : 0;
+  if (!t) return null;
+  discadaEm.delete(sid);
+  return (Date.now() - t) / 1000;
+}
+async function resolverCortada(sid) {
+  const sb = await getSupabaseLogado();
+  if (!sb) return;
+  const { data: lig } = await sb.client.from("ligacoes")
+    .select("id, status, campanha_id, contato_id").eq("twilio_call_sid", sid).maybeSingle();
+  if (!lig || lig.status !== "ligando") return;
+  cortadasNoToque.delete(sid);
+  await resolverNaoAtendida(sb.client, lig, MOTIVO_CORTE_TOQUE);
+}
+
+// ============================================================================
 // DISCADOR — a campanha anda sozinha até o fim
 // ============================================================================
 // Quem chama discar():
@@ -1094,6 +1200,7 @@ async function discar(campanhaId, origem = "painel") {
 
       try {
         const call = await twilioClient.calls.create(opcoesDaChamada(contato.telefone, twimlUrl));
+        vigiarToque(call.sid);                       // FASE 12.5: corta antes da caixa postal
         await supabase.from("ligacoes").insert({
           user_id: userId, campanha_id: campanhaId, contato_id: item.contato_id,
           status: "ligando", twilio_call_sid: call.sid, iniciada_em: new Date().toISOString(),
@@ -1196,6 +1303,8 @@ app.post("/twilio/status", async (req, res) => {
   const detalhes = ["SipResponseCode", "ErrorCode", "ErrorMessage", "AnsweredBy"]
     .filter((k) => req.body?.[k]).map((k) => `${k}=${req.body[k]}`).join(" ");
   console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)${detalhes ? " | " + detalhes : ""}`);
+  pararDeVigiarToque(sid);                           // FASE 12.5: terminou, não precisa mais cortar
+  discadaEm.delete(sid);
   if (status === "completed" && duracao > 0) {
     console.log(`[twilio-status] atendida (${duracao}s) — o motor cuida do registro`);
     return;
@@ -1207,13 +1316,15 @@ app.post("/twilio/status", async (req, res) => {
     const { data: lig } = await sb.client.from("ligacoes")
       .select("id, status, campanha_id, contato_id").eq("twilio_call_sid", sid).maybeSingle();
     if (!lig || lig.status !== "ligando") return;
-    await resolverNaoAtendida(sb.client, lig, ROTULO_STATUS[status] || "Sem conversa");
+    const cortadaPorMim = status === "canceled" && cortadasNoToque.delete(sid);   // FASE 12.5
+    await resolverNaoAtendida(sb.client, lig, cortadaPorMim ? MOTIVO_CORTE_TOQUE : (ROTULO_STATUS[status] || "Sem conversa"));
   } catch (e) {
     console.error("[twilio-status] erro:", e?.message);
   }
 });
 
 app.all("/twiml", (req, res) => {
+  pararDeVigiarToque(req.body?.CallSid || req.query.CallSid);   // FASE 12.5: atendeu
   const campanhaId = req.query.campanha_id || "";
   const contatoId = req.query.contato_id || "";
   const saudacao = req.query.saudacao || "Olá, tudo bem? Você tem um minutinho?";
@@ -1235,6 +1346,7 @@ app.all("/twiml", (req, res) => {
 });
 
 app.all("/twiml-streams", (req, res) => {
+  pararDeVigiarToque(req.body?.CallSid || req.query.CallSid);   // FASE 12.5: atendeu
   const host = PUBLIC_HOST || req.headers.host;
   const wsUrl = `wss://${host}/ws-streams`;
   const campanhaId = req.query.campanha_id || "";
@@ -1305,6 +1417,7 @@ app.get("/streams/teste", async (req, res) => {
     };
     if (GRAVAR_LIGACOES) { opcoes.record = true; opcoes.recordingChannels = "dual"; }
     const call = await twilioClient.calls.create(opcoes);
+    vigiarToque(call.sid);                           // FASE 12.5: corta antes da caixa postal
     console.log("[streams/teste] ligando para", para, "agente:", agenteId || "(nenhum)");
     res.json({ ok: true, ligando_para: para, agente_id: agenteId || null, callSid: call.sid });
   } catch (e) {
@@ -1992,8 +2105,10 @@ wssStreams.on("connection", (ws) => {
       return;
     }
     // Assistente de chamadas: só uma pessoa de verdade ("Alô?", "Oi", "Quem é?") tira da espera
+    // FASE 12.5: "Diga quem você é e informe o…" (pedaço da fala do assistente de IA) começa
+    // com "Diga" mas é o assistente — não tira da espera
     if (st.triagem) {
-      if (ehAloHumano(texto)) sairDaTriagem(texto);
+      if (ehAloHumano(texto) && !RE_FALA_DO_ASSISTENTE.test(normalizar(texto))) sairDaTriagem(texto);
       else L(st, `[triagem] (ignorado, assistente ainda na linha) "${texto}"`);
       return;
     }
@@ -2488,7 +2603,10 @@ wssStreams.on("connection", (ws) => {
       st.campanhaId = p.campanha_id || "";
       st.contatoId = p.contato_id || "";
       st.agenteId = p.agente_id || "";
-      L(st, `[streams] início — callSid: ${st.callSid} | agente: ${st.agenteId || "(nenhum)"}`);
+      pararDeVigiarToque(st.callSid);                // FASE 12.5: atendeu, não corta mais
+      const toque = segundosDeToque(st.callSid);
+      L(st, `[streams] início — callSid: ${st.callSid} | agente: ${st.agenteId || "(nenhum)"}` +
+        (toque != null ? ` | atendeu com ${toque.toFixed(1)}s de toque` : ""));
       iniciarConversa().catch((e) => LE(st, `[streams] erro ao iniciar: ${e?.message || e}`));
       return;
     }
@@ -2540,9 +2658,12 @@ wssStreams.on("connection", (ws) => {
     // FASE 12.4: "permaneça na linha" sozinho não é conversa → o contato volta pra fila
     const falasDaPessoa = st.historico.filter((m) => m.role === "user");
     const soPediuEspera = falasDaPessoa.length > 0 && falasDaPessoa.every((m) => tipoDeMaquina(m.content) === "espera");
-    const conversou = !st.caixaPostal && falasDaPessoa.length > 0 && !soPediuEspera;
+    // FASE 12.5: só "Alô?" / "Oi?" / "Quem é?" a ligação inteira também não é conversa
+    const soAlo = falasDaPessoa.length > 0 && falasDaPessoa.every((m) => soDisseAlo(m.content));
+    const conversou = !st.caixaPostal && falasDaPessoa.length > 0 && !soPediuEspera && !soAlo;
     const motivoSemConversa = conversou ? "" : (st.motivoSemConversa ||
       (soPediuEspera ? "Pediram pra aguardar e ninguém voltou"
+        : soAlo ? "Atendeu, só disse \"alô\" e não conversou"
         : st.triagem ? "Assistente de chamadas: não passou a ligação"
         : st.algumaVoz ? "Atendeu e desligou sem responder" : "Atendeu e ficou em silêncio"));
     await gravarLigacao({
