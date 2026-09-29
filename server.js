@@ -1,6 +1,24 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.4 — LIÇÕES DA LISTA 100.V1 (28/09, 86 ligações)
+ *   "Permaneça na linha" / "só um minutinho": o Carlos responde "Tudo bem, eu aguardo."
+ *     e NUNCA desliga nessa hora (na V1 o Claude marcou [FIM] e ele desligou no Márcio).
+ *     Espera calado até 45s SÓ quando pedem pra esperar. Ninguém voltou: fala UM
+ *     "Alô, você ainda está aí?" e, sem resposta em 5s, desliga (sem mais insistência)
+ *   Pedido de espera sozinho não conta como conversa: se ninguém voltar, o contato
+ *     volta pra fila e é chamado de novo (antes virava "concluída" e nunca mais ligava)
+ *   Assistente de chamadas do celular ("diga seu nome e o motivo"): o Carlos fala o
+ *     nome da pessoa e se apresenta ("Oi, Márcio! Aqui é o Carlos, da Invite Energy.
+ *     É sobre o desconto na conta de luz.") e espera a pessoa atender no MÁXIMO 50s no
+ *     total (o "permaneça na linha" do assistente não estica). Ninguém atendeu → desliga,
+ *     próximo contato, e esse volta na 2ª tentativa
+ *   A Twilio às vezes encerra a ligação mas segue mandando áudio por mais ~70s: 3s
+ *     depois de desligar, se o túnel não fechou, o motor fecha (duração certa no
+ *     relatório e a vaga do discador fica livre na hora)
+ *   "3 por vez" agora vale no TOTAL: duas campanhas rodando juntas não passam de 3
+ *     ligações ao mesmo tempo (antes eram 3 por campanha = 6)
+ * ---------------------------------------------------------------------------
  * FASE 12.3 — AJUSTES DO TESTE DE 28/09 (13h)
  *   Abertura: se ouviu voz mas o texto do "Alô?" ainda não chegou, espera o texto
  *     (o Deepgram demora ~1s) — no teste o Carlos começou 0,7s depois e atropelou
@@ -102,11 +120,15 @@ const ALO_VOZ_SEM_TEXTO_MS = parseInt(process.env.ALO_VOZ_SEM_TEXTO_MS || "1600"
 const ALO_MAX_MS = parseInt(process.env.ALO_MAX_MS || "6000", 10);          // limite da espera
 // Espera ("permaneça na linha", "aguarde") e assistente de chamadas
 const ESPERA_MAX_MS = parseInt(process.env.ESPERA_MAX_MS || "45000", 10);
-const TRIAGEM_MAX_MS = parseInt(process.env.TRIAGEM_MAX_MS || "60000", 10);
-const FRASE_MOTIVO_TRIAGEM = process.env.FRASE_MOTIVO_TRIAGEM || "Estou ligando sobre desconto na conta de luz.";
+// Acabou a espera e ninguém voltou: depois do "você ainda está aí?", desliga se ficar mudo esse tempo
+const ESPERA_ALO_MS = parseInt(process.env.ESPERA_ALO_MS || "5000", 10);
+const TRIAGEM_MAX_MS = parseInt(process.env.TRIAGEM_MAX_MS || "50000", 10);   // FASE 12.4: 50s no total
+const FRASE_MOTIVO_TRIAGEM = process.env.FRASE_MOTIVO_TRIAGEM ?? "É sobre o desconto na conta de luz.";
 // Silêncio total (nunca ouviu voz): depois da re-pergunta curta, desliga
 const FRASE_ALO = "Alô? Tá me ouvindo?";
 const SILENCIO_SEM_VOZ_MS = parseInt(process.env.SILENCIO_SEM_VOZ_MS || "4000", 10);
+// Depois de desligar: se a Twilio não fechar o túnel de áudio nesse tempo, o motor fecha
+const FECHAR_TUNEL_MS = parseInt(process.env.FECHAR_TUNEL_MS || "3000", 10);
 
 const BARGE_MIN_CHARS = parseInt(process.env.BARGE_MIN_CHARS || "14", 10);
 const MIN_FALA_PRIMEIRA = parseInt(process.env.MIN_FALA_PRIMEIRA || "12", 10);
@@ -229,7 +251,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.3`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.4`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -249,14 +271,14 @@ function avisarFaltando() {
     `| resposta no fim da pergunta: guarda ${JANELA_RESPOSTA_MS}ms | cérebro: limite ${CLAUDE_TIMEOUT_MS}ms pra começar a responder`
   );
   console.log(
-    `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez | horário ${descricaoHorario()} (Brasília) ` +
+    `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez no total (todas as campanhas) | horário ${descricaoHorario()} (Brasília) ` +
     `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.3`
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.4`
   );
   console.log(
     `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms, voz sem texto ${ALO_VOZ_SEM_TEXTO_MS}ms)` : "fala na hora"} ` +
-    `| assistente de chamadas: se apresenta e espera até ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
-    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s | FASE 12.3`
+    `| assistente de chamadas: diz o nome da pessoa, se apresenta e espera no máx ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
+    `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s (só quando pedem), ninguém voltou → 1 "alô" e desliga em ${Math.round(ESPERA_ALO_MS / 1000)}s | FASE 12.4`
   );
 }
 
@@ -440,6 +462,11 @@ const RE_ALO_HUMANO = /^(e |mas )?(alo|oi|ola|opa|pronto|pois nao|sim|fala|diga|
 function ehAloHumano(texto) {
   const n = normalizar(texto);
   return !!n && n.split(" ").length <= 8 && RE_ALO_HUMANO.test(n);
+}
+// A última fala da pessoa foi um pedido pra esperar ("permaneça na linha", "só um minutinho")
+function pediramPraEsperar(st) {
+  const ultima = [...st.historico].reverse().find((m) => m.role === "user");
+  return !!ultima && tipoDeMaquina(ultima.content) === "espera";
 }
 // Espera em silêncio: sem "cortou aqui" e sem "você ainda está aí?" até o prazo
 function entrarEmEspera(st, motivo, ms = ESPERA_MAX_MS) {
@@ -679,8 +706,9 @@ FORMATO DA FALA (isto vira áudio):
 Números por extenso. Nada de listas, asteriscos ou emojis.
 O único marcador que existe é [FIM]. Nunca escreva outra coisa entre colchetes.
 
-SE PEDIREM PRA ESPERAR ("aguarde", "só um minutinho", "vou chamar ele"):
-responda só "Tudo bem, eu aguardo." e pare. Não explique nada.
+SE PEDIREM PRA ESPERAR ("aguarde", "permaneça na linha", "só um minutinho", "vou chamar ele"):
+responda só "Tudo bem, eu aguardo." e NÃO escreva [FIM]: a ligação continua e o sistema
+espera a pessoa voltar. Não explique nada.
 
 SE QUEM ATENDEU NÃO FOR A PESSOA (filho, esposa, secretária) ou disser que a conta
 é de outra pessoa: pergunte se dá pra falar com ela agora. Se não der, pergunte o
@@ -868,7 +896,7 @@ async function resolverNaoAtendida(supabase, lig, motivo) {
 //   • o botão Iniciar do painel (POST /campanhas/iniciar)
 //   • o fim de cada ligação (continuarDepois)
 //   • o relógio, a cada CAMPANHA_CHECA_S (retentativas, agendadas, segurança)
-// Regras: no máximo MAX_CONCURRENT_CALLS no ar por campanha; nunca liga de novo
+// Regras: no máximo MAX_CONCURRENT_CALLS no ar no TOTAL (todas as campanhas); nunca liga de novo
 // pra quem já conversou nesta campanha; tentativas contadas pelo histórico real
 // de ligações (o Iniciar do painel zera o status e as tentativas da fila).
 
@@ -893,7 +921,9 @@ function descricaoHorario() {
     (LIGAR_DOMINGO ? `dom ${fmtHora(HORA_INICIO)}–${fmtHora(HORA_FIM_SABADO)}` : "dom não");
 }
 
-// Uma rodada de discagem por vez em cada campanha (evita discar o mesmo contato 2x)
+// Uma rodada de discagem por vez (FASE 12.4: fila única pra todas as campanhas, assim o
+// limite de ligações no ar vale no total e ninguém é discado 2x)
+const FILA_DO_DISCADOR = "discador";
 const rodadaDaCampanha = new Map();
 function umaPorVez(campanhaId, tarefa) {
   const antes = rodadaDaCampanha.get(campanhaId) || Promise.resolve();
@@ -928,7 +958,7 @@ function erroDaContaTwilio(http, codigo) {
 }
 
 async function discar(campanhaId, origem = "painel") {
-  return umaPorVez(campanhaId, async () => {
+  return umaPorVez(FILA_DO_DISCADOR, async () => {
     if (!twilioClient) return { status: 500, corpo: { error: "Twilio não configurado" } };
     const sb = await getSupabaseLogado();
     if (!sb) return { status: 500, corpo: { error: "login Supabase falhou" } };
@@ -995,7 +1025,16 @@ async function discar(campanhaId, origem = "painel") {
       if (l.status === "ligando" && t > limiteNoAr && !h.noAr) { h.noAr = true; noAr++; }
       porContato.set(l.contato_id, h);
     }
-    const vagas = Math.max(0, MAX_CONCURRENT_CALLS - noAr);
+    // FASE 12.4: vagas contam as ligações no ar de TODAS as campanhas (campanha de teste,
+    // até 3 contatos, continua ligando na hora mesmo com outra campanha rodando)
+    let ocupadas = noAr;
+    if (!teste) {
+      const { count: noArTotal, error: erroNoAr } = await supabase.from("ligacoes")
+        .select("id", { count: "exact", head: true })
+        .eq("status", "ligando").gt("iniciada_em", new Date(limiteNoAr).toISOString());
+      if (!erroNoAr && noArTotal != null) ocupadas = Math.max(noAr, noArTotal);
+    }
+    const vagas = Math.max(0, MAX_CONCURRENT_CALLS - ocupadas);
 
     const { data: fila, error: erroFila } = await supabase.from("campanha_contatos")
       .select("id, contato_id, status, tentativas, atualizado_em")
@@ -1098,12 +1137,12 @@ async function discar(campanhaId, origem = "painel") {
     }
     if (manual) await supabase.from("campanhas").update({ status: "em_andamento" }).eq("id", campanhaId);
     if (dialed > 0 || manual) {
-      console.log(`[discador] "${nomeCamp}" (${origem}): ${dialed} discada(s) | no ar: ${noAr + dialed} ` +
+      console.log(`[discador] "${nomeCamp}" (${origem}): ${dialed} discada(s) | no ar: ${ocupadas + dialed} (todas as campanhas) ` +
         `| esperando: ${esperando}` +
         (religar ? ` | 🧪 campanha de teste (até ${MAX_CONCURRENT_CALLS} contatos)` +
           (foraDoHorario ? ": liguei mesmo fora do horário" : "") : ""));
     }
-    return { status: 200, corpo: { started: true, dialed, no_ar: noAr + dialed, na_fila: esperando, motor: MOTOR_PADRAO } };
+    return { status: 200, corpo: { started: true, dialed, no_ar: ocupadas + dialed, na_fila: esperando, motor: MOTOR_PADRAO } };
   });
 }
 
@@ -1546,6 +1585,15 @@ async function desligar(st, motivo) {
       L(st, "[fim] ligação encerrada pelo motor ✅");
     } catch (e) { LE(st, `[fim] erro ao desligar: ${e?.message}`); }
   }
+  // FASE 12.4: às vezes a Twilio encerra a ligação mas segue mandando áudio por mais ~70s
+  // (V1: Márcio 101s, Aline 93s). Se o túnel não fechar sozinho, o motor fecha.
+  const t = setTimeout(() => {
+    if (!st.fechado && st.ws && st.ws.readyState === 1) {
+      LW(st, `[fim] a Twilio não fechou o áudio em ${FECHAR_TUNEL_MS / 1000}s — fechei o túnel`);
+      try { st.ws.close(); } catch {}
+    }
+  }, FECHAR_TUNEL_MS);
+  t.unref?.();
 }
 
 // Frase avulsa do vigia (re-pergunta, resgate, despedida por silêncio)
@@ -1801,6 +1849,11 @@ async function pensarEResponder(ws, st, falaDoCliente) {
       L(st, `[cerebro] turno completo em ${Date.now() - inicio}ms`);
     }
 
+    // FASE 12.4: pediram pra aguardar → a ligação continua (V1: o Claude marcou [FIM] no Márcio)
+    if (pediuFim && pediramPraEsperar(st)) {
+      pediuFim = false;
+      L(st, "[fim] ⏸️ pediram pra aguardar — ignorei o [FIM], a ligação continua");
+    }
     if (pediuFim && st.encerrarAuto && st.turno === meuTurno) {
       st.fimPendente = true;
       st.ultimaPergunta = "";
@@ -1860,9 +1913,10 @@ wssStreams.on("connection", (ws) => {
     caixaPostal: false, motivoSemConversa: "", naoLigarMais: false,
     // FASE 12.2: abertura, espera, assistente de chamadas, falas interrompidas
     aguardandoAlo: false, primeiraVozEm: 0, ultimaAtividadeEm: 0, ultimoTextoEm: 0, ouviuAlo: "",
-    esperaAte: 0, triagem: false, triagemFeita: false,
+    esperaAte: 0, triagem: false, triagemFeita: false, triagemAte: 0, fimDaEsperaEm: 0,
     parcial: null, palavrasProtegidas: null, algumaVoz: false,
     fimDaFala: null,
+    ws,                     // FASE 12.4: pra fechar o túnel se a Twilio não fechar
   };
   L(st, "[streams] túnel aberto, aguardando áudio…");
 
@@ -2024,7 +2078,7 @@ wssStreams.on("connection", (ws) => {
       return false;
     }
     if (tipo === "espera") {
-      if (st.triagem) { entrarEmEspera(st, `assistente: "${texto}"`, TRIAGEM_MAX_MS); return true; }
+      if (st.triagem) { entrarEmEspera(st, `assistente: "${texto}"`, Math.max(0, (st.triagemAte || 0) - Date.now())); return true; }
       entrarEmEspera(st, `pediram pra aguardar: "${texto}"`);
       return false;   // gente de verdade: o Claude responde "Tudo bem, eu aguardo."
     }
@@ -2046,10 +2100,12 @@ wssStreams.on("connection", (ws) => {
   }
 
   // "Aqui é o Carlos, da Invite Energy." (tirado da saudação) + motivo
+  // FASE 12.4: "Oi, Márcio! Aqui é o Carlos, da Invite Energy. É sobre o desconto na conta de luz."
   function fraseDeTriagem() {
     const m = String(st.saudacao || "").match(/aqui (é|e) [^.!?]+/i);
     const quem = m ? m[0].trim().replace(/^./, (c) => c.toUpperCase()) + "." : "";
-    return juntarTexto(quem, FRASE_MOTIVO_TRIAGEM);
+    const pra = st.nomeCliente ? `Oi, ${st.nomeCliente}!` : "";
+    return juntarTexto(juntarTexto(pra, quem), FRASE_MOTIVO_TRIAGEM);
   }
   function entrarNaTriagem(texto) {
     st.triagem = true; st.triagemFeita = true; st.aguardandoAlo = false;
@@ -2057,6 +2113,7 @@ wssStreams.on("connection", (ws) => {
     calarABoca(ws, st, "assistente de chamadas");
     limparFlush(); st.balde = ""; st.ultimoInterim = ""; st.repeticoes = 0;
     st.transcricao.push(`Assistente do celular: ${texto}`);
+    st.triagemAte = Date.now() + TRIAGEM_MAX_MS;          // FASE 12.4: no máximo 50s no total
     entrarEmEspera(st, "assistente de chamadas", TRIAGEM_MAX_MS);
     falarAvulso(ws, st, fraseDeTriagem(), "triagem")
       .then(() => { st.ultimaPergunta = ""; st.jaRepetiuPergunta = true; })
@@ -2353,6 +2410,7 @@ wssStreams.on("connection", (ws) => {
         return;
       }
       L(st, "[espera] ⌛ acabou o tempo de espera");
+      st.fimDaEsperaEm = agora;                  // FASE 12.4: se ninguém voltar, 1 "alô" e desliga
       st.calado_desde = agora - st.silencioMs;   // chama "Alô, você ainda está aí?" já
     }
 
@@ -2388,6 +2446,15 @@ wssStreams.on("connection", (ws) => {
       L(st, "[vigia] 🔇 ninguém falou nada na ligação — desligando (tenta de novo depois)");
       st.vigiaOcupado = true;
       try { await desligar(st, "silêncio total"); } finally { st.vigiaOcupado = false; }
+      return;
+    }
+    // FASE 12.4: acabou a espera e ninguém voltou → depois de UM "você ainda está aí?", desliga
+    if (st.fimDaEsperaEm && st.tentativasResgate >= 1 &&
+        st.ultimoTextoEm < st.fimDaEsperaEm && st.vozEm < st.fimDaEsperaEm) {
+      if (mudoHa < Math.min(ESPERA_ALO_MS, st.silencioMs)) return;
+      L(st, "[espera] 🔇 ninguém voltou — desligando (tenta de novo depois)");
+      st.vigiaOcupado = true;
+      try { await desligar(st, "ninguém voltou da espera"); } finally { st.vigiaOcupado = false; }
       return;
     }
     if (mudoHa < st.silencioMs) return;
@@ -2470,9 +2537,13 @@ wssStreams.on("connection", (ws) => {
     if (st.streamClaude) { try { st.streamClaude.abort(); } catch {} }
     if (st.dg) { try { st.dg.close(); } catch {} }
 
-    const conversou = !st.caixaPostal && st.historico.some((m) => m.role === "user");
+    // FASE 12.4: "permaneça na linha" sozinho não é conversa → o contato volta pra fila
+    const falasDaPessoa = st.historico.filter((m) => m.role === "user");
+    const soPediuEspera = falasDaPessoa.length > 0 && falasDaPessoa.every((m) => tipoDeMaquina(m.content) === "espera");
+    const conversou = !st.caixaPostal && falasDaPessoa.length > 0 && !soPediuEspera;
     const motivoSemConversa = conversou ? "" : (st.motivoSemConversa ||
-      (st.triagem ? "Assistente de chamadas: não passou a ligação"
+      (soPediuEspera ? "Pediram pra aguardar e ninguém voltou"
+        : st.triagem ? "Assistente de chamadas: não passou a ligação"
         : st.algumaVoz ? "Atendeu e desligou sem responder" : "Atendeu e ficou em silêncio"));
     await gravarLigacao({
       supabase: st.campanhaId ? st.supabase : null,
