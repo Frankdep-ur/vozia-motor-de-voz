@@ -1,6 +1,24 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.6 — REGRAS DO FRANK (30/09, depois da V3)
+ *   Tocou e ninguém atendeu (corte dos 33s, "não atendeu" da operadora, ocupado): a
+ *     ligação fica com status "nao_atendida" (painel: "Não atendeu")
+ *   Acabaram as 2 tentativas sem conversar com o Carlos (não atendeu, caixa postal,
+ *     silêncio…): o contato é DESCARTADO — nenhuma campanha liga de novo (Frank, 30/09
+ *     16:55). Na campanha fica o motivo ("Não atendeu" / "Sem resposta"). NÃO descarta:
+ *     Falha na chamada (SIP 403 = rota, não a pessoa), campanha de teste, contato
+ *     "convertido" / "nao_atender". Desliga com DESCARTAR_SEM_CONVERSA=0
+ *   2ª tentativa só DEPOIS que a lista inteira teve a 1ª ligação (e com o intervalo
+ *     mínimo RETENTAR_APOS_MIN desde a 1ª ligação daquele contato). Total 2 tentativas
+ *   Atendeu e não respondeu a 1ª pergunta: o Carlos fala só "Olá, [nome], você está
+ *     aí?" (no lugar do "Desculpa, acho que cortou aqui…" e do "Alô? Tá me ouvindo?").
+ *     Ninguém respondeu em 7s (ESTA_AI_MS) → desliga; volta 1 vez depois do ciclo
+ *   Já tem desconto (qualquer %) ou placa solar própria: o Claude agradece, encerra e
+ *     escreve [DESCARTAR] → ligação "descartado", contato "Descartado" no painel e em
+ *     TODAS as campanhas (o discador nunca mais liga)
+ *   Resposta sem nada a ver com a pergunta: pode se reapresentar UMA vez (regra técnica)
+ * ---------------------------------------------------------------------------
  * FASE 12.5 — CUSTO DA TWILIO (29/09, V1 + V2: 198 ligações)
  *   80% do gasto da Twilio foi com máquina (caixa postal / recado de operadora): a
  *     Twilio cobra o MINUTO CHEIO mesmo quando a ligação dura 15s
@@ -147,6 +165,9 @@ const FRASE_MOTIVO_TRIAGEM = process.env.FRASE_MOTIVO_TRIAGEM ?? "É sobre o des
 // Silêncio total (nunca ouviu voz): depois da re-pergunta curta, desliga
 const FRASE_ALO = "Alô? Tá me ouvindo?";
 const SILENCIO_SEM_VOZ_MS = parseInt(process.env.SILENCIO_SEM_VOZ_MS || "4000", 10);
+// FASE 12.6: a 1ª pergunta ficou sem resposta → "Olá, [nome], você está aí?" e, sem
+// resposta nesse tempo, desliga (regra do Frank: 7s)
+const ESTA_AI_MS = parseInt(process.env.ESTA_AI_MS || "7000", 10);
 // Depois de desligar: se a Twilio não fechar o túnel de áudio nesse tempo, o motor fecha
 const FECHAR_TUNEL_MS = parseInt(process.env.FECHAR_TUNEL_MS || "3000", 10);
 
@@ -271,7 +292,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.4`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.6`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -292,15 +313,19 @@ function avisarFaltando() {
   );
   console.log(
     `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez no total (todas as campanhas) | horário ${descricaoHorario()} (Brasília) ` +
-    `| não atendeu: tenta de novo após ${RETENTAR_APOS_MIN} min | caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
+    `| 2ª tentativa: depois da lista inteira e ${RETENTAR_APOS_MIN} min após a 1ª ` +
+    `| 2 tentativas sem conversa: ${DESCARTAR_SEM_CONVERSA ? "DESCARTA o contato (falha na chamada não)" : "off"} ` +
+    `| caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
     `| corte do toque: ${TEMPO_MAX_TOQUE_S > 0 ? `${TEMPO_MAX_TOQUE_S}s (antes da caixa postal, não é cobrada)` : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.5`
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.6`
   );
   console.log(
     `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms, voz sem texto ${ALO_VOZ_SEM_TEXTO_MS}ms)` : "fala na hora"} ` +
     `| assistente de chamadas: diz o nome da pessoa, se apresenta e espera no máx ${Math.round(TRIAGEM_MAX_MS / 1000)}s ` +
     `| "aguarde": espera calado até ${Math.round(ESPERA_MAX_MS / 1000)}s (só quando pedem), ninguém voltou → 1 "alô" e desliga em ${Math.round(ESPERA_ALO_MS / 1000)}s ` +
-    `| só "alô" / recado gravado pelo cliente: não conta como conversa (volta pra fila) | FASE 12.5`
+    `| só "alô" / recado gravado pelo cliente: não conta como conversa (volta pra fila) ` +
+    `| 1ª pergunta sem resposta: "Olá, [nome], você está aí?" e desliga em ${Math.round(ESTA_AI_MS / 1000)}s ` +
+    `| já tem desconto/placa solar: agradece, desliga e DESCARTA o contato | FASE 12.6`
   );
 }
 
@@ -735,7 +760,11 @@ Exemplo: "Fechado, te mando agora. Valeu e até mais! [FIM]"`;
 
 VOCÊ JÁ FALOU ISTO ASSIM QUE A PESSOA ATENDEU:
 "${saudacao}"
-Não se apresente de novo, a não ser que a pessoa pergunte quem é.
+Não se apresente de novo, a não ser que a pessoa pergunte quem é OU responda algo que não
+tem nada a ver com a pergunta (aí se reapresente UMA vez, do jeito que o roteiro manda).
+Se o sistema perguntou "você está aí?" e a pessoa só confirmou que está na linha ("tô aqui",
+"oi", "sim", "pode falar"), refaça a pergunta curta do roteiro — esse "sim" é "estou aqui",
+NÃO é resposta à pergunta.
 
 SOBRE O NOME:
 ${blocoNome}
@@ -747,7 +776,14 @@ A transcrição do telefone às vezes erra e chega uma palavra sem sentido
 
 FORMATO DA FALA (isto vira áudio):
 Números por extenso. Nada de listas, asteriscos ou emojis.
-O único marcador que existe é [FIM]. Nunca escreva outra coisa entre colchetes.
+Os únicos marcadores que existem são [FIM] e [DESCARTAR]. Nunca escreva outra coisa entre colchetes.
+
+SE A PESSOA JÁ TEM DESCONTO NA CONTA DE LUZ (qualquer porcentagem, com qualquer empresa)
+OU TEM PLACA SOLAR PRÓPRIA: ela não é cliente da Invite. Assim que ela disser isso, agradeça
+e encerre em UMA frase, sem perguntar mais nada e sem oferecer comparação, e escreva
+[DESCARTAR] no final (no lugar do [FIM]). Exemplo:
+"Que bom, Ana! Então você já está economizando. Obrigado e tenha um ótimo dia! [DESCARTAR]"
+O [DESCARTAR] NÃO é falado: é o sinal pro sistema desligar e tirar o contato da lista.
 
 SE PEDIREM PRA ESPERAR ("aguarde", "permaneça na linha", "só um minutinho", "vou chamar ele"):
 responda só "Tudo bem, eu aguardo." e NÃO escreva [FIM]: a ligação continua e o sistema
@@ -761,7 +797,8 @@ números que a pessoa ditar — o sistema anota. Diga só "Anotado, obrigado!".
 ════════ REGRAS DE OURO (valem mais que tudo acima) ════════
 1. UMA pergunta por resposta. Fez a pergunta, PARE e espere a resposta.
 
-2. A conversa já começou: NÃO cumprimente de novo (nada de "oi" ou "tudo bem?").
+2. A conversa já começou: NÃO cumprimente de novo (nada de "oi" ou "tudo bem?"), a não ser
+   na reapresentação de quando a resposta não tem nada a ver.
 
 3. WHATSAPP:
    • Primeiro confirme se o número da ligação é o WhatsApp da pessoa.
@@ -772,9 +809,8 @@ números que a pessoa ditar — o sistema anota. Diga só "Anotado, obrigado!".
    • Se mesmo assim não der certo, NÃO insista: diga que a equipe liga nesse
      mesmo número pra confirmar o WhatsApp, e encerre.
 
-4. VALOR DA CONTA: pergunte no máximo duas vezes. Se não entender, diga
-   "Sem problema, a simulação usa a foto da sua conta" e vá pro fechamento.
-   O valor NÃO é obrigatório.
+4. VALOR DA CONTA: só pergunte se o roteiro pedir, e no máximo duas vezes. O valor NÃO
+   é obrigatório: se não entender, vá pro fechamento no WhatsApp.
 
 5. No máximo duas frases curtas por resposta. Quando o roteiro trouxer uma fala pronta
    (como a explicação de como funciona o desconto), diga ela inteira, do jeito que está.${blocoFim}`;
@@ -900,13 +936,39 @@ const ROTULO_STATUS = {
   "canceled": "Cancelada", "completed": "Desligou antes de atender",
 };
 
-async function resolverNaoAtendida(supabase, lig, motivo) {
+// FASE 12.6: tocou e ninguém atendeu (corte dos 33s, "não atendeu" da operadora, ocupado)
+// → status "nao_atendida" (painel: "Não atendeu") em vez de "sem_resposta"
+const STATUS_NAO_ATENDIDA = "nao_atendida";
+const STATUS_DESCARTADO = "descartado";
+
+// FASE 12.6 (Frank, 30/09 16:55): acabaram as tentativas SEM conversar com o Carlos → o
+// contato é DESCARTADO (nenhuma campanha liga de novo). Na campanha fica o motivo; na lista
+// de Contatos, "Descartado". Não descarta: Falha na chamada (quem chama decide), campanha de
+// teste (até MAX_CONCURRENT_CALLS contatos) e contato "convertido" / "nao_atender".
+const DESCARTAR_SEM_CONVERSA = String(process.env.DESCARTAR_SEM_CONVERSA ?? "1") !== "0";
+const MARCA_DESCARTE_SEM_CONVERSA = "→ contato DESCARTADO (2 tentativas sem conversa)";
+
+async function descartarSemConversa(supabase, campanhaId, contatoId) {
+  if (!DESCARTAR_SEM_CONVERSA || !supabase || !campanhaId || !contatoId) return false;
+  const { count: totalContatos } = await supabase.from("campanha_contatos")
+    .select("id", { count: "exact", head: true }).eq("campanha_id", campanhaId);
+  if (totalContatos != null && totalContatos <= MAX_CONCURRENT_CALLS) return false;   // campanha de teste
+  const { data: ct } = await supabase.from("contatos").select("status").eq("id", contatoId).maybeSingle();
+  if (!ct || !["novo", "ligado"].includes(ct.status)) return false;
+  const { error } = await supabase.from("contatos").update({ status: STATUS_DESCARTADO })
+    .eq("id", contatoId).in("status", ["novo", "ligado"]);
+  if (error) throw new Error(error.message);
+  return true;
+}
+
+async function resolverNaoAtendida(supabase, lig, motivo, { naoAtendeu = false } = {}) {
   let resolvi = false;
+  const statusFinal = naoAtendeu ? STATUS_NAO_ATENDIDA : "sem_resposta";
   try {
     const { data: atual } = await supabase.from("ligacoes").select("status").eq("id", lig.id).maybeSingle();
     if (!atual || atual.status !== "ligando") return;
     await supabase.from("ligacoes").update({
-      status: "sem_resposta", resultado: motivo, finalizada_em: new Date().toISOString(),
+      status: statusFinal, resultado: motivo, finalizada_em: new Date().toISOString(),
     }).eq("id", lig.id).eq("status", "ligando");
     resolvi = true;
     if (!lig.campanha_id || !lig.contato_id) return;
@@ -920,10 +982,21 @@ async function resolverNaoAtendida(supabase, lig, motivo) {
     const tent = cc.tentativas || 0;
     const volta = tent < maxTent;
     await supabase.from("campanha_contatos").update({
-      status: volta ? "na_fila" : "sem_resposta", atualizado_em: new Date().toISOString(),
+      status: volta ? "na_fila" : statusFinal, atualizado_em: new Date().toISOString(),
     }).eq("id", cc.id).eq("status", "ligando");
+    // FASE 12.6: não atendeu na última tentativa → descarta (Falha na chamada não descarta)
+    let descartado = false;
+    if (!volta && naoAtendeu) {
+      try {
+        descartado = await descartarSemConversa(supabase, lig.campanha_id, lig.contato_id);
+        if (descartado) await supabase.from("ligacoes")
+          .update({ resultado: `${motivo} ${MARCA_DESCARTE_SEM_CONVERSA}` }).eq("id", lig.id);
+      } catch (e) { console.error("[fila] erro ao descartar o contato:", e?.message); }
+    }
     console.log(`[fila] ${motivo} — tentativa ${tent}/${maxTent} → ` +
-      (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
+      (volta ? "🔄 VOLTOU PRA FILA (2ª tentativa depois da lista inteira)"
+        : `❌ esgotou as tentativas${naoAtendeu ? " — sai da lista como \"Não atendeu\"" : ""}` +
+          (descartado ? " — 🗑️ contato DESCARTADO (nenhuma campanha liga de novo)" : "")));
   } catch (e) {
     console.error("[fila] erro ao resolver:", e?.message);
   } finally {
@@ -992,7 +1065,7 @@ async function resolverCortada(sid) {
     .select("id, status, campanha_id, contato_id").eq("twilio_call_sid", sid).maybeSingle();
   if (!lig || lig.status !== "ligando") return;
   cortadasNoToque.delete(sid);
-  await resolverNaoAtendida(sb.client, lig, MOTIVO_CORTE_TOQUE);
+  await resolverNaoAtendida(sb.client, lig, MOTIVO_CORTE_TOQUE, { naoAtendeu: true });
 }
 
 // ============================================================================
@@ -1123,11 +1196,12 @@ async function discar(campanhaId, origem = "painel") {
     let noAr = 0;
     for (const l of hist) {
       if (!l.contato_id) continue;
-      const h = porContato.get(l.contato_id) || { tentativas: 0, conversou: false, noAr: false, ultima: 0 };
+      const h = porContato.get(l.contato_id) || { tentativas: 0, conversou: false, descartado: false, noAr: false, ultima: 0, ultimoStatus: "" };
       h.tentativas++;
       const t = l.iniciada_em ? Date.parse(l.iniciada_em) : 0;
-      if (t > h.ultima) h.ultima = t;
-      if (l.status === "atendida") h.conversou = true;
+      if (t >= h.ultima) { h.ultima = t; h.ultimoStatus = l.status || ""; }
+      if (l.status === "atendida" || l.status === STATUS_DESCARTADO) h.conversou = true;
+      if (l.status === STATUS_DESCARTADO) h.descartado = true;             // FASE 12.6: já tem desconto
       if (l.status === "ligando" && t > limiteNoAr && !h.noAr) { h.noAr = true; noAr++; }
       porContato.set(l.contato_id, h);
     }
@@ -1153,12 +1227,18 @@ async function discar(campanhaId, origem = "painel") {
       .update({ status, atualizado_em: new Date().toISOString() }).eq("id", id);
     const escolhidos = [];
     let esperando = 0;
+    // FASE 12.6: a 2ª tentativa só começa quando a lista INTEIRA já teve a 1ª ligação
+    const temPrimeiraPendente = (fila || []).some((it) => !porContato.get(it.contato_id));
     for (const item of fila || []) {
       const h = porContato.get(item.contato_id);
       if (h?.noAr) continue;                                                   // está no telefone agora
       if (!religar) {
-        if (h?.conversou) { await marcar(item.id, "concluida"); continue; }     // já falou com o Carlos
-        if (h && h.tentativas >= maxTent) { await marcar(item.id, "sem_resposta"); continue; }
+        if (h?.conversou) { await marcar(item.id, h.descartado ? STATUS_DESCARTADO : "concluida"); continue; }   // já falou com o Carlos
+        if (h && h.tentativas >= maxTent) {
+          await marcar(item.id, h.ultimoStatus === STATUS_NAO_ATENDIDA ? STATUS_NAO_ATENDIDA : "sem_resposta");
+          continue;
+        }
+        if (h && h.tentativas > 0 && temPrimeiraPendente) { esperando++; continue; }   // a lista ainda não acabou
         if (h && h.tentativas > 0 && Date.now() - h.ultima < RETENTAR_APOS_MIN * 60000) { esperando++; continue; }
       }
       if (escolhidos.length < vagas) escolhidos.push({ item, h });
@@ -1179,6 +1259,11 @@ async function discar(campanhaId, origem = "painel") {
       if (contato.status === "nao_atender") {
         await marcar(item.id, "falhou");
         console.log(`[discador] 🚫 ${contato.nome || contato.telefone} está como "Não atender" — pulei`);
+        continue;
+      }
+      if (contato.status === STATUS_DESCARTADO && !religar) {            // FASE 12.6
+        await marcar(item.id, STATUS_DESCARTADO);
+        console.log(`[discador] 🗑️ ${contato.nome || contato.telefone} está como "Descartado" (já tem desconto/placa ou 2 tentativas sem conversa) — pulei`);
         continue;
       }
       const tentativa = (h?.tentativas || 0) + 1;
@@ -1317,7 +1402,9 @@ app.post("/twilio/status", async (req, res) => {
       .select("id, status, campanha_id, contato_id").eq("twilio_call_sid", sid).maybeSingle();
     if (!lig || lig.status !== "ligando") return;
     const cortadaPorMim = status === "canceled" && cortadasNoToque.delete(sid);   // FASE 12.5
-    await resolverNaoAtendida(sb.client, lig, cortadaPorMim ? MOTIVO_CORTE_TOQUE : (ROTULO_STATUS[status] || "Sem conversa"));
+    // FASE 12.6: tocou e ninguém atendeu → status "Não atendeu"
+    const naoAtendeu = cortadaPorMim || status === "no-answer" || status === "busy";
+    await resolverNaoAtendida(sb.client, lig, cortadaPorMim ? MOTIVO_CORTE_TOQUE : (ROTULO_STATUS[status] || "Sem conversa"), { naoAtendeu });
   } catch (e) {
     console.error("[twilio-status] erro:", e?.message);
   }
@@ -1592,11 +1679,14 @@ Transcrição:\n\n${transcricao}` }],
   if (zapDuvida && !String(resultado || "").includes(zapDuvida)) resultado = juntarTexto(resultado, `WhatsApp NÃO confirmado: ${zapDuvida}.`);
   if (!houveConversa && extras.motivoSemConversa && !resultado) resultado = extras.motivoSemConversa;
   if (extras.naoLigarMais) resultado = juntarTexto(resultado, "PEDIU PARA NÃO LIGAR MAIS (contato marcado como Não atender).");
+  // FASE 12.6: já tem desconto / placa solar própria → não é cliente, sai de todas as listas
+  const descartar = houveConversa && extras.descartar && !extras.naoLigarMais;
+  if (descartar) resultado = juntarTexto("JÁ TEM DESCONTO OU PLACA SOLAR — contato DESCARTADO (não é cliente).", resultado);
   if (resultado || sentimento || nota !== null) L(st, `[relatorio] resumo: ${sentimento} | nota ${nota} | ${resultado}`);
 
   try {
     await supabase.from("ligacoes").update({
-      status: houveConversa ? "atendida" : "sem_resposta",
+      status: descartar ? STATUS_DESCARTADO : houveConversa ? "atendida" : "sem_resposta",
       duracao_segundos: duracao, transcricao, resultado, sentimento, nota,
       finalizada_em: new Date().toISOString(),
     }).eq("twilio_call_sid", callSid);
@@ -1605,12 +1695,17 @@ Transcrição:\n\n${transcricao}` }],
       await supabase.from("contatos").update({ status: "nao_atender" }).eq("id", contatoId);
       L(st, "[contato] 🚫 marcado como \"Não atender\" — nenhuma campanha liga de novo");
     }
+    if (contatoId && descartar) {
+      const { error: erroDesc } = await supabase.from("contatos").update({ status: STATUS_DESCARTADO }).eq("id", contatoId);
+      if (erroDesc) LE(st, `[contato] erro ao descartar: ${erroDesc.message}`);
+      else L(st, "[contato] 🗑️ marcado como \"Descartado\" (já tem desconto) — nenhuma campanha liga de novo");
+    }
     if (campanhaId && contatoId) {
       if (houveConversa) {
         await supabase.from("campanha_contatos").update({
-          status: "concluida", atualizado_em: new Date().toISOString(),
+          status: descartar ? STATUS_DESCARTADO : "concluida", atualizado_em: new Date().toISOString(),
         }).eq("campanha_id", campanhaId).eq("contato_id", contatoId);
-        L(st, "[fila] ✅ conversa registrada — contato concluído");
+        L(st, descartar ? "[fila] 🗑️ já tem desconto — contato descartado" : "[fila] ✅ conversa registrada — contato concluído");
       } else {
         const { data: camp } = await supabase.from("campanhas")
           .select("max_tentativas").eq("id", campanhaId).maybeSingle();
@@ -1623,8 +1718,18 @@ Transcrição:\n\n${transcricao}` }],
           await supabase.from("campanha_contatos").update({
             status: volta ? "na_fila" : "sem_resposta", atualizado_em: new Date().toISOString(),
           }).eq("id", cc.id);
+          // FASE 12.6: última tentativa sem conversa (caixa postal, silêncio…) → descarta
+          let descartado = false;
+          if (!volta && !extras.naoLigarMais) {
+            try {
+              descartado = await descartarSemConversa(supabase, campanhaId, contatoId);
+              if (descartado) await supabase.from("ligacoes")
+                .update({ resultado: `${resultado || "Sem conversa"} ${MARCA_DESCARTE_SEM_CONVERSA}` }).eq("twilio_call_sid", callSid);
+            } catch (e) { LE(st, `[contato] erro ao descartar: ${e?.message}`); }
+          }
           L(st, `[fila] ${extras.motivoSemConversa ? extras.motivoSemConversa.toLowerCase() : "atendeu mas não falou"} — tentativa ${tent}/${maxTent} → ` +
-            (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas"));
+            (volta ? "🔄 VOLTOU PRA FILA" : "❌ esgotou as tentativas") +
+            (descartado ? " — 🗑️ contato DESCARTADO (nenhuma campanha liga de novo)" : ""));
         }
       }
     }
@@ -1860,6 +1965,12 @@ async function pensarEResponder(ws, st, falaDoCliente) {
 
   const limparMarca = (t) => {
     if (/\[FIM\]/i.test(t)) pediuFim = true;
+    // FASE 12.6: já tem desconto / placa solar → encerra e descarta o contato
+    if (/\[DESCARTAR\]/i.test(t)) {
+      pediuFim = true;
+      if (!st.descartar) L(st, "[fim] 🗑️ já tem desconto — o Claude marcou [DESCARTAR]");
+      st.descartar = true;
+    }
     if (/\[(AGUARD|ESPER)[^\]]*\]/i.test(t)) entrarEmEspera(st, "o Claude marcou espera");
     return semMarcadores(t);
   };
@@ -1964,7 +2075,7 @@ async function pensarEResponder(ws, st, falaDoCliente) {
 
     // FASE 12.4: pediram pra aguardar → a ligação continua (V1: o Claude marcou [FIM] no Márcio)
     if (pediuFim && pediramPraEsperar(st)) {
-      pediuFim = false;
+      pediuFim = false; st.descartar = false;
       L(st, "[fim] ⏸️ pediram pra aguardar — ignorei o [FIM], a ligação continua");
     }
     if (pediuFim && st.encerrarAuto && st.turno === meuTurno) {
@@ -2014,6 +2125,7 @@ wssStreams.on("connection", (ws) => {
     ultimaPergunta: "", jaRepetiuPergunta: false,
     falaAtual: "", falaAnterior: "",
     tentativasResgate: 0, vigiaOcupado: false,
+    perguntouEstaAi: false, estaAiDesde: 0, descartar: false,   // FASE 12.6
     encerrando: false, despedindo: false, fimPendente: false, fechado: false,
     campanhaId: "", contatoId: "", agenteId: "",
     agente: null, contato: null, supabase: null,
@@ -2538,6 +2650,20 @@ wssStreams.on("connection", (ws) => {
       const naSaudacao = !st.historico.some((m) => m.role === "user");
       const limite = Math.min(naSaudacao ? REPERGUNTA_SAUDACAO_MS : REPERGUNTA_MS, st.silencioMs);
       const atalhoVoz = !naSaudacao && ouviuVoz && agora - st.vozEm >= REPERGUNTA_VOZ_MS;
+      // FASE 12.6 (regra do Frank): a 1ª pergunta ficou sem resposta → só "Olá, [nome], você
+      // está aí?" (não repete a pergunta inteira). Sem resposta em 7s → desliga (vigia abaixo)
+      if (naSaudacao && esperou >= limite) {
+        st.jaRepetiuPergunta = true;
+        st.perguntouEstaAi = true;
+        st.estaAiDesde = agora;
+        const frase = st.nomeCliente ? `Olá, ${st.nomeCliente}, você está aí?` : "Olá, você está aí?";
+        L(st, `[vigia] ${(esperou / 1000).toFixed(1)}s sem resposta à 1ª pergunta${ouviuVoz ? " (ouvi voz, sem texto)" : ""} — ` +
+          `"${frase}" (desliga em ${Math.round(ESTA_AI_MS / 1000)}s se ninguém responder)`);
+        st.vigiaOcupado = true;
+        try { await falarAvulso(ws, st, frase, "esta-ai"); }
+        finally { st.vigiaOcupado = false; }
+        return;
+      }
       if (atalhoVoz || esperou >= limite) {
         st.jaRepetiuPergunta = true;
         // Nunca ouviu voz nenhuma na ligação: um "Alô?" curto em vez de repetir a saudação inteira
@@ -2553,6 +2679,16 @@ wssStreams.on("connection", (ws) => {
 
     // 2) Silêncio longo: resgate → resgate → despedida
     const mudoHa = agora - st.calado_desde;
+    // FASE 12.6: "Olá, [nome], você está aí?" e ninguém respondeu em 7s → desliga
+    // (volta 1 vez depois que a lista inteira for discada)
+    if (st.perguntouEstaAi && st.ultimoTextoEm < st.estaAiDesde) {
+      if (mudoHa < ESTA_AI_MS) return;
+      st.motivoSemConversa = st.algumaVoz ? "Atendeu e não respondeu" : "Atendeu e ficou em silêncio";
+      L(st, `[vigia] 🔇 ninguém respondeu ao "você está aí?" em ${Math.round(ESTA_AI_MS / 1000)}s — desligando (tenta de novo depois da lista)`);
+      st.vigiaOcupado = true;
+      try { await desligar(st, "não respondeu à 1ª pergunta"); } finally { st.vigiaOcupado = false; }
+      return;
+    }
     // Ninguém falou NADA na ligação (recado da operadora gravando, ou atendeu e largou):
     // depois do "Alô?" desliga logo e tenta de novo mais tarde
     if (!st.algumaVoz && st.jaRepetiuPergunta) {
@@ -2677,6 +2813,7 @@ wssStreams.on("connection", (ws) => {
         whatsappNaoConfirmado: st.whatsappConfirmado ? "" : st.numeroEntendido,
         motivoSemConversa,
         naoLigarMais: st.naoLigarMais,
+        descartar: !!st.descartar,                 // FASE 12.6: já tem desconto / placa solar
       },
       st,
     });
