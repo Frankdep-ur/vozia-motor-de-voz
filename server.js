@@ -1,6 +1,20 @@
 /**
  * VozIA — Motor de Voz  (versão Lovable Cloud)
  * ---------------------------------------------------------------------------
+ * FASE 12.7 — NÚMERO QUE NÃO EXISTE (30/09, 17:28)
+ *   A "Falha na chamada" com SIP 403 é número que NÃO EXISTE (conferido pelo Frank: ABR
+ *     sem dados / "número incorreto" ligando de um celular). Agora o motor descarta o
+ *     contato JÁ NA 1ª TENTATIVA (não gasta a 2ª): ligação "Número não existe (SIP 403)
+ *     → contato DESCARTADO", campanha "Falhou", contato "Descartado"
+ *   Códigos: 403, 404, 410, 484, 604 (SIP_NUMERO_INEXISTENTE)
+ *   TRAVA: só descarta se outras ligações estão completando (a rede da Twilio está
+ *     funcionando nos últimos 10 min). Se a Twilio cair e tudo der falha, ninguém é
+ *     descartado — o contato volta pra fila como antes. Desliga: DESCARTAR_NUMERO_INEXISTENTE=0
+ *   Outras falhas mostram o código no resultado ("Falha na chamada (SIP 503)")
+ *   Roteiro v5 (Frank, 17:48): depois do "não" o Carlos fala a sequência pronta (4 frases,
+ *     ~480 letras) e pergunta o valor da conta. MAX_TOKENS_RESPOSTA 110 → 260, senão a
+ *     resposta era cortada antes da pergunta do valor
+ * ---------------------------------------------------------------------------
  * FASE 12.6 — REGRAS DO FRANK (30/09, depois da V3)
  *   Tocou e ninguém atendeu (corte dos 33s, "não atendeu" da operadora, ocupado): a
  *     ligação fica com status "nao_atendida" (painel: "Não atendeu")
@@ -195,6 +209,10 @@ const FRASE_REPERGUNTA = "Desculpa, acho que cortou aqui.";
 
 // Cérebro: tempo máximo até a primeira palavra do Claude
 const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS || "7000", 10);
+// FASE 12.7: roteiro v5 tem fala pronta de ~480 letras (~150 tokens) depois do "não".
+// Com 110 a resposta era cortada antes da pergunta do valor. Só limita o máximo: a
+// resposta continua curta quando o roteiro pede, e a fala começa no mesmo tempo.
+const MAX_TOKENS_RESPOSTA = parseInt(process.env.MAX_TOKENS_RESPOSTA || "260", 10);
 const FRASE_FALHA = "Desculpa, falhou aqui. Pode repetir, por favor?";
 
 // Ouvido
@@ -292,7 +310,7 @@ function avisarFaltando() {
   if (!VOICE_BACKEND_SECRET) console.warn("[VozIA] ⚠️ VOICE_BACKEND_SECRET vazia — discador e callback desprotegidos!");
   console.log(
     `[VozIA] motor: ${MOTOR_PADRAO} | rota de teste: ${PERMITIR_TESTE ? "ABERTA ⚠️" : "fechada 🔒"} ` +
-    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.6`
+    `| secretária: ${DETECTAR_SECRETARIA ? "detectar" : "off"} | gravação: ${GRAVAR_LIGACOES ? "ON ⚠️" : "off"} | FASE 12.7`
   );
   console.log(
     `[VozIA] ouvido: ${DG_MODEL} | números em ${DG_SMART_FORMAT ? "algarismos" : "palavras"} ` +
@@ -309,15 +327,16 @@ function avisarFaltando() {
   );
   console.log(
     `[VozIA] re-pergunta: ${REPERGUNTAR ? `ON (${REPERGUNTA_MS}ms, ou ${REPERGUNTA_VOZ_MS}ms se ouviu voz)` : "off"} ` +
-    `| resposta no fim da pergunta: guarda ${JANELA_RESPOSTA_MS}ms | cérebro: limite ${CLAUDE_TIMEOUT_MS}ms pra começar a responder`
+    `| resposta no fim da pergunta: guarda ${JANELA_RESPOSTA_MS}ms | cérebro: limite ${CLAUDE_TIMEOUT_MS}ms pra começar a responder, até ${MAX_TOKENS_RESPOSTA} tokens por resposta`
   );
   console.log(
     `[VozIA] discador: automático, ${MAX_CONCURRENT_CALLS} por vez no total (todas as campanhas) | horário ${descricaoHorario()} (Brasília) ` +
     `| 2ª tentativa: depois da lista inteira e ${RETENTAR_APOS_MIN} min após a 1ª ` +
-    `| 2 tentativas sem conversa: ${DESCARTAR_SEM_CONVERSA ? "DESCARTA o contato (falha na chamada não)" : "off"} ` +
+    `| 2 tentativas sem conversa: ${DESCARTAR_SEM_CONVERSA ? "DESCARTA o contato" : "off"} ` +
+    `| número não existe (SIP ${[...SIP_NUMERO_INEXISTENTE].join("/")}): ${DESCARTAR_NUMERO_INEXISTENTE ? `DESCARTA na 1ª (se a rede completou ligação nos últimos ${Math.round(REDE_OK_JANELA_MS / 60000)} min)` : "off"} ` +
     `| caixa postal: ${CAIXA_POSTAL ? "desliga e tenta depois" : "off"} ` +
     `| corte do toque: ${TEMPO_MAX_TOQUE_S > 0 ? `${TEMPO_MAX_TOQUE_S}s (antes da caixa postal, não é cobrada)` : "off"} ` +
-    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.6`
+    `| agora: ${dentroDoHorario() ? "DENTRO do horário" : "fora do horário"} | FASE 12.7`
   );
   console.log(
     `[VozIA] abertura: ${ESPERAR_ALO ? `espera o alô (silêncio ${ALO_SILENCIO_MS}ms, pausa ${ALO_PAUSA_MS}ms, voz sem texto ${ALO_VOZ_SEM_TEXTO_MS}ms)` : "fala na hora"} ` +
@@ -961,7 +980,19 @@ async function descartarSemConversa(supabase, campanhaId, contatoId) {
   return true;
 }
 
-async function resolverNaoAtendida(supabase, lig, motivo, { naoAtendeu = false } = {}) {
+// FASE 12.7 (Frank, 30/09 17:28): número que NÃO EXISTE → descarta já na 1ª tentativa.
+// A rede recusa número inexistente com SIP 403 (conferido: ABR sem dados / "número incorreto"
+// ligando de celular). TRAVA: só vale se a rede está funcionando (alguma ligação tocou ou foi
+// atendida nos últimos REDE_OK_JANELA_MS). Se a Twilio cair e tudo falhar, ninguém é descartado.
+const DESCARTAR_NUMERO_INEXISTENTE = String(process.env.DESCARTAR_NUMERO_INEXISTENTE ?? "1") !== "0";
+const SIP_NUMERO_INEXISTENTE = new Set([403, 404, 410, 484, 604]);
+const REDE_OK_JANELA_MS = parseInt(process.env.REDE_OK_JANELA_MS || "600000", 10);
+const MARCA_NUMERO_INEXISTENTE = "→ contato DESCARTADO";
+let ultimaLigacaoQueConectou = 0;          // última ligação que tocou/atendeu (qualquer fim ≠ failed)
+const redeFuncionando = () => Date.now() - ultimaLigacaoQueConectou < REDE_OK_JANELA_MS;
+function redeConectou() { ultimaLigacaoQueConectou = Date.now(); }
+
+async function resolverNaoAtendida(supabase, lig, motivo, { naoAtendeu = false, numeroInexistente = false } = {}) {
   let resolvi = false;
   const statusFinal = naoAtendeu ? STATUS_NAO_ATENDIDA : "sem_resposta";
   try {
@@ -980,13 +1011,24 @@ async function resolverNaoAtendida(supabase, lig, motivo, { naoAtendeu = false }
       .eq("campanha_id", lig.campanha_id).eq("contato_id", lig.contato_id).maybeSingle();
     if (!cc || cc.status !== "ligando") return;
     const tent = cc.tentativas || 0;
-    const volta = tent < maxTent;
+    let volta = tent < maxTent;
+    let descartado = false, inexistente = false;
+    // FASE 12.7: número que não existe → descarta já, sem 2ª tentativa
+    if (numeroInexistente) {
+      try {
+        inexistente = descartado = await descartarSemConversa(supabase, lig.campanha_id, lig.contato_id);
+        if (inexistente) {
+          volta = false;
+          await supabase.from("ligacoes")
+            .update({ resultado: `${motivo} ${MARCA_NUMERO_INEXISTENTE}` }).eq("id", lig.id);
+        }
+      } catch (e) { console.error("[fila] erro ao descartar o contato:", e?.message); }
+    }
     await supabase.from("campanha_contatos").update({
-      status: volta ? "na_fila" : statusFinal, atualizado_em: new Date().toISOString(),
+      status: volta ? "na_fila" : inexistente ? "falhou" : statusFinal, atualizado_em: new Date().toISOString(),
     }).eq("id", cc.id).eq("status", "ligando");
-    // FASE 12.6: não atendeu na última tentativa → descarta (Falha na chamada não descarta)
-    let descartado = false;
-    if (!volta && naoAtendeu) {
+    // FASE 12.6: não atendeu na última tentativa → descarta
+    if (!volta && naoAtendeu && !descartado) {
       try {
         descartado = await descartarSemConversa(supabase, lig.campanha_id, lig.contato_id);
         if (descartado) await supabase.from("ligacoes")
@@ -994,7 +1036,8 @@ async function resolverNaoAtendida(supabase, lig, motivo, { naoAtendeu = false }
       } catch (e) { console.error("[fila] erro ao descartar o contato:", e?.message); }
     }
     console.log(`[fila] ${motivo} — tentativa ${tent}/${maxTent} → ` +
-      (volta ? "🔄 VOLTOU PRA FILA (2ª tentativa depois da lista inteira)"
+      (inexistente ? "🗑️ NÚMERO NÃO EXISTE — contato DESCARTADO sem 2ª tentativa (nenhuma campanha liga de novo)"
+        : volta ? "🔄 VOLTOU PRA FILA (2ª tentativa depois da lista inteira)"
         : `❌ esgotou as tentativas${naoAtendeu ? " — sai da lista como \"Não atendeu\"" : ""}` +
           (descartado ? " — 🗑️ contato DESCARTADO (nenhuma campanha liga de novo)" : "")));
   } catch (e) {
@@ -1390,6 +1433,8 @@ app.post("/twilio/status", async (req, res) => {
   console.log(`[twilio-status] ${sid} → ${status} (${duracao}s)${detalhes ? " | " + detalhes : ""}`);
   pararDeVigiarToque(sid);                           // FASE 12.5: terminou, não precisa mais cortar
   discadaEm.delete(sid);
+  const sip = parseInt(req.body?.SipResponseCode || "0", 10) || 0;
+  if (status && status !== "failed") redeConectou();   // FASE 12.7: a rede está completando ligações
   if (status === "completed" && duracao > 0) {
     console.log(`[twilio-status] atendida (${duracao}s) — o motor cuida do registro`);
     return;
@@ -1404,7 +1449,16 @@ app.post("/twilio/status", async (req, res) => {
     const cortadaPorMim = status === "canceled" && cortadasNoToque.delete(sid);   // FASE 12.5
     // FASE 12.6: tocou e ninguém atendeu → status "Não atendeu"
     const naoAtendeu = cortadaPorMim || status === "no-answer" || status === "busy";
-    await resolverNaoAtendida(sb.client, lig, cortadaPorMim ? MOTIVO_CORTE_TOQUE : (ROTULO_STATUS[status] || "Sem conversa"), { naoAtendeu });
+    // FASE 12.7: SIP 403/404/410/484/604 = número que não existe → descarta já (se a rede está ok)
+    const numeroInexistente = status === "failed" && SIP_NUMERO_INEXISTENTE.has(sip)
+      && DESCARTAR_NUMERO_INEXISTENTE && redeFuncionando();
+    if (status === "failed" && SIP_NUMERO_INEXISTENTE.has(sip) && !numeroInexistente && DESCARTAR_NUMERO_INEXISTENTE)
+      console.log(`[twilio-status] SIP ${sip}, mas nenhuma ligação completou nos últimos ${Math.round(REDE_OK_JANELA_MS / 60000)} min — não descarto (pode ser pane da rede)`);
+    const motivo = cortadaPorMim ? MOTIVO_CORTE_TOQUE
+      : numeroInexistente ? `Número não existe (SIP ${sip})`
+      : status === "failed" && sip ? `Falha na chamada (SIP ${sip})`
+      : (ROTULO_STATUS[status] || "Sem conversa");
+    await resolverNaoAtendida(sb.client, lig, motivo, { naoAtendeu, numeroInexistente });
   } catch (e) {
     console.error("[twilio-status] erro:", e?.message);
   }
@@ -1993,7 +2047,7 @@ async function pensarEResponder(ws, st, falaDoCliente) {
     st.transcricao.push(`Cliente: ${falaDoCliente}`);
 
     stream = anthropic.messages.stream({
-      model: CLAUDE_MODEL, max_tokens: 110, system: st.persona, messages: sanitizar(st.historico),
+      model: CLAUDE_MODEL, max_tokens: MAX_TOKENS_RESPOSTA, system: st.persona, messages: sanitizar(st.historico),
     });
     st.streamClaude = stream;
     cao = setTimeout(() => {
@@ -2740,6 +2794,7 @@ wssStreams.on("connection", (ws) => {
       st.contatoId = p.contato_id || "";
       st.agenteId = p.agente_id || "";
       pararDeVigiarToque(st.callSid);                // FASE 12.5: atendeu, não corta mais
+      if (st.campanhaId) redeConectou();               // FASE 12.7: a rede está completando ligações
       const toque = segundosDeToque(st.callSid);
       L(st, `[streams] início — callSid: ${st.callSid} | agente: ${st.agenteId || "(nenhum)"}` +
         (toque != null ? ` | atendeu com ${toque.toFixed(1)}s de toque` : ""));
